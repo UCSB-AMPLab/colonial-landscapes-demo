@@ -11,18 +11,23 @@
  * - Layer 2: A deeper panel that stacks on top of Layer 1, triggered by a
  *   button inside the Layer 1 content.
  * - Glossary: A panel that can open from any context when the user clicks a
- *   glossary link in story or panel content.
+ *   glossary link in story or panel content. telar.js opens it, not
+ *   openPanel(); it joins the stack here when it shows, so that it is the
+ *   topmost panel the keys close. It never adds a layer to the URL fragment;
+ *   a glossary link in a layer adds g{n}, its running number in that layer,
+ *   which leaves the fragment when the glossary panel closes.
  *
  * The panel stack tracks which panels are open and in what order. Closing
  * always removes the topmost panel. The user can close panels with the back
- * button, Escape key, left arrow key, or by clicking outside the panel.
+ * button, Escape key, left arrow key, or by clicking outside the panel. What
+ * an open panel covers is made inert by telar.js.
  *
  * When any panel is open, the scroll lock system blocks step navigation
  * (wheel events, keyboard arrows, touch swipes) and shows a subtle backdrop.
  * This is the "panel freeze" system — panels are truly modal and must be
  * explicitly dismissed.
  *
- * @version v1.6.0
+ * @version v1.8.0
  */
 
 import { state } from './state.js';
@@ -84,6 +89,11 @@ export function initializePanels() {
     });
   }
 
+  const glossaryPanel = document.getElementById('panel-glossary');
+  if (glossaryPanel) {
+    glossaryPanel.addEventListener('show.bs.offcanvas', joinGlossaryToStack);
+  }
+
   // Bootstrap can dismiss a panel without going through closePanel (the
   // offcanvas X button uses data-bs-dismiss), so panel state is reconciled
   // on hidden.bs.offcanvas — the one event every dismissal path fires.
@@ -102,6 +112,21 @@ export function initializePanels() {
       }
     });
   });
+}
+
+/**
+ * Put the glossary panel on top of the panel stack as it shows.
+ *
+ * The panel freezes the story as a layer does. The URL fragment is not
+ * rewritten: it names layers only, and a glossary link writes its own g{n}.
+ */
+export function joinGlossaryToStack() {
+  const top = state.panelStack[state.panelStack.length - 1];
+  if (top?.type !== 'glossary') {
+    state.panelStack.push({ type: 'glossary', id: null });
+  }
+  state.isPanelOpen = true;
+  activateScrollLock();
 }
 
 /**
@@ -135,8 +160,10 @@ export function openPanel(panelType, contentId) {
     const contentElement = document.getElementById(`${panelId}-content`);
     contentElement.innerHTML = content.html;
 
-    // Assign deep-link running numbers to glossary links
-    const glossaryLinks = contentElement.querySelectorAll('.glossary-link');
+    // Assign deep-link running numbers to glossary links. The class is the one
+    // scripts/telar/glossary.py writes for a resolved term; an unresolved term
+    // is a span that opens nothing, so it takes no number.
+    const glossaryLinks = contentElement.querySelectorAll('.glossary-inline-link');
     glossaryLinks.forEach((el, i) => {
       el.dataset.deepLinkN = i + 1;
     });
@@ -245,6 +272,11 @@ export function closeAllPanels() {
  * driven separately by telar.js writing directly into
  * #panel-glossary-content, not through openPanel()/getPanelContent().
  *
+ * A panel with no title of its own is headed by the label of the button that
+ * opened it, and a blank button carries the site language's default label, so
+ * the fallback is that same translated string. The heading is not left empty:
+ * an empty <h1> is still announced as a heading, with nothing to read.
+ *
  * @param {string} panelType - 'layer1' or 'layer2'.
  * @param {string} contentId - The step number.
  * @returns {{ title: string, html: string, demo?: boolean }|null}
@@ -268,13 +300,13 @@ function getPanelContent(panelType, contentId) {
     }
 
     return {
-      title: step.layer1_title || step.layer1_button || 'Layer 1',
+      title: step.layer1_title || step.layer1_button || window.telarLang.learnMore,
       html: html,
       demo: step.layer1_demo || false,
     };
   } else if (panelType === 'layer2') {
     return {
-      title: step.layer2_title || step.layer2_button || 'Layer 2',
+      title: step.layer2_title || step.layer2_button || window.telarLang.goDeeper,
       html: formatPanelContent({
         text: step.layer2_text,
         media: step.layer2_media,

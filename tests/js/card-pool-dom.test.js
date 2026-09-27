@@ -11,7 +11,7 @@
  * positioning, scene maps, tile URLs) live in the sibling file,
  * card-pool.test.js.
  *
- * @version v1.7.0
+ * @version v1.8.0
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -20,11 +20,16 @@ import {
   setCardProgress,
   activateCard,
   initCardPool,
+  reconcilePlatesForJump,
 } from '../../assets/js/telar-story/card-pool.js';
 import { state } from '../../assets/js/telar-story/state.js';
 import {
   deactivateVideoCard, updateVideoClip,
 } from '../../assets/js/telar-story/video-card.js';
+import { VideoPlate } from '../../assets/js/telar-story/plates/video-plate.js';
+import { AudioPlate } from '../../assets/js/telar-story/plates/audio-plate.js';
+import { IiifPlate } from '../../assets/js/telar-story/plates/iiif-plate.js';
+import { makePlate } from './iiif-plate-helpers.js';
 
 // Video-card is spied, not replaced: every export keeps its real body, and the
 // two the card pool routes plate handovers through are wrapped so a test can
@@ -51,7 +56,6 @@ describe('setCardProgress — title card fallback', () => {
   beforeEach(() => {
     state.textCards  = {};
     state.titleCards = {};
-    state.cardRegistry = [];
   });
 
   it('is exported and does not throw when progress < 0.001', () => {
@@ -122,9 +126,12 @@ describe('cardOverlayRect — rect populated in reduced-motion synchronous branc
     // Mock getBoundingClientRect to return a known rect
     mockCard.getBoundingClientRect = vi.fn().mockReturnValue(MOCK_RECT);
 
-    // Wire minimal card-pool state: text card + registry entry for step 0, same object as currentObjectRun
+    // Wire minimal card-pool state. The card carries its own step, object and
+    // run position, as _createTextCards writes them.
+    mockCard.dataset.stepIndex = '0';
+    mockCard.dataset.object = 'obj-a';
+    mockCard.dataset.runPosition = '0';
     state.textCards = { 0: mockCard };
-    state.cardRegistry = [{ stepIndex: 0, objectId: 'obj-a', runPosition: 0, element: mockCard }];
 
     activateCard(0, 'forward');
 
@@ -166,27 +173,29 @@ describe('activateCard — same-object jump re-shows a hidden viewer plate', () 
     const card = document.createElement('div');
     card.getBoundingClientRect = vi.fn().mockReturnValue(
       { top: 0, left: 0, width: 1, height: 1, bottom: 1, right: 1 });
+    card.dataset.stepIndex = '0';
+    card.dataset.object = 'obj-a';
+    card.dataset.runPosition = '0';
     state.textCards = { 0: card };
-    state.cardRegistry = [{ stepIndex: 0, objectId: 'obj-a', runPosition: 0, element: card }];
   }
 
   it('re-adds is-active to the scene plate that a jump had hidden', () => {
-    const plate = document.createElement('div'); // plain IIIF plate, no is-active
+    const plate = makePlate();  // no is-active: a jump hid it
     wireStep0(plate);
 
-    expect(plate.classList.contains('is-active')).toBe(false);
+    expect(plate.container.classList.contains('is-active')).toBe(false);
     activateCard(0, 'forward'); // same-object jump after navigateToStep hid plates
-    expect(plate.classList.contains('is-active')).toBe(true);
-    expect(plate.style.transform).toMatch(/translateY\(0\)/);
+    expect(plate.container.classList.contains('is-active')).toBe(true);
+    expect(plate.container.style.transform).toMatch(/translateY\(0\)/);
   });
 
   it('leaves an already-active plate untouched (idempotent during normal scroll)', () => {
-    const plate = document.createElement('div');
-    plate.classList.add('is-active');
+    const plate = makePlate();
+    plate.container.classList.add('is-active');
     wireStep0(plate);
 
     activateCard(0, 'forward');
-    expect(plate.classList.contains('is-active')).toBe(true);
+    expect(plate.container.classList.contains('is-active')).toBe(true);
   });
 });
 
@@ -202,7 +211,6 @@ describe('cardOverlayRect — null on title-card activation', () => {
 
     state.viewerPlates  = {};
     state.viewerCards   = [];
-    state.cardRegistry  = [];
     state.textCards     = {};
     state.activeTitleCardIndex = null;
   });
@@ -214,6 +222,72 @@ describe('cardOverlayRect — null on title-card activation', () => {
     activateCard(0, 'forward');
 
     expect(state.cardOverlayRect).toBeNull();
+  });
+});
+
+// ── A run starts where a scene starts ────────────────────────────────────────
+//
+// computeCardTop centres the first card of a run and settles each later card
+// peekHeight lower. That contract holds only if the run counter restarts when
+// the run does. A story that returns to an object starts a new scene there, so
+// keying the counter by object instead carried the count across the gap and
+// left the returning card peekHeight lower for every earlier appearance,
+// compounding on each return.
+//
+// Invisible on default settings — card_peek_height defaults to 1 — and plainly
+// visible on a site that raises it, which is why it wants a test rather than an
+// eye.
+
+describe('initCardPool — a run starts where its scene starts', () => {
+  beforeEach(() => {
+    resetPoolState();
+    vi.stubGlobal('matchMedia', vi.fn().mockImplementation(REDUCED_MOTION));
+    // The viewer wrapper wants the vendored global and fetches before using it;
+    // a fetch that never settles leaves it suspended, which is enough for the
+    // build phase this asserts on.
+    vi.stubGlobal('OpenSeadragon', vi.fn());
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.body.innerHTML = '';
+    resetPoolState();
+  });
+
+  // A A B A A after the intro — the reader leaves object A and comes back
+  const steps = [
+    { step: '1', object: 'A', question: 'q', answer: 'a' },
+    { step: '2', object: 'A', question: 'q', answer: 'a' },
+    { step: '3', object: 'B', question: 'q', answer: 'a' },
+    { step: '4', object: 'A', question: 'q', answer: 'a' },
+    { step: '5', object: 'A', question: 'q', answer: 'a' },
+  ];
+
+  it('restarts the run position when the story returns to an object', () => {
+    buildStory(steps);
+
+    const runPositions = Object.keys(state.textCards)
+      .map(Number)
+      .sort((a, b) => a - b)
+      .map((i) => Number(state.textCards[i].dataset.runPosition));
+
+    // not [0, 1, 0, 2, 3], which is what a per-object counter produces
+    expect(runPositions).toEqual([0, 1, 0, 0, 1]);
+  });
+
+  it('gives every card that begins a scene run position zero', () => {
+    buildStory(steps);
+
+    for (const [key, card] of Object.entries(state.textCards)) {
+      const stepIndex = Number(key);
+      const beginsScene =
+        state.sceneFirstStep[state.stepToScene[stepIndex]] === stepIndex;
+      if (beginsScene) {
+        expect(Number(card.dataset.runPosition),
+               `step ${stepIndex} begins its run`).toBe(0);
+      }
+    }
   });
 });
 
@@ -231,14 +305,12 @@ describe('initCardPool — built card content escapes author text', () => {
     state.objectsIndex = {};
     state.viewerPlates = {};
     state.textCards = {};
-    state.cardRegistry = [];
   });
 
   afterEach(() => {
     document.body.innerHTML = '';
     state.viewerPlates = {};
     state.textCards = {};
-    state.cardRegistry = [];
     state.titleCards = {};
   });
 
@@ -299,7 +371,6 @@ function resetPoolState() {
   state.viewerCards = [];
   state.textCards = {};
   state.titleCards = {};
-  state.cardRegistry = [];
   state.activeTitleCardIndex = null;
   state.currentObjectRun = { objectId: null, runPosition: 0 };
   state.cardOverlayRect = null;
@@ -330,7 +401,8 @@ describe('initCardPool — media plates carry their class and clip window', () =
     buildStory([{ step: '1', object: 'test-video', question: 'Q', answer: 'A',
                   clip_start: '12', clip_end: '34', loop: 'true' }]);
 
-    const plate = state.viewerPlates[1];
+    expect(state.viewerPlates[1]).toBeInstanceOf(VideoPlate);
+    const plate = state.viewerPlates[1].container;
     expect(plate.classList.contains('video-plate')).toBe(true);
     expect(plate.dataset.cardType).toBe('youtube');
     expect(plate.dataset.clipStart).toBe('12');
@@ -345,7 +417,8 @@ describe('initCardPool — media plates carry their class and clip window', () =
       { step: '2', object: 'test-vimeo', question: 'Q2', answer: 'A2', clip_start: '90' },
     ]);
 
-    const plate = state.viewerPlates[1];
+    expect(state.viewerPlates[1]).toBeInstanceOf(VideoPlate);
+    const plate = state.viewerPlates[1].container;
     expect(plate.dataset.cardType).toBe('vimeo');
     expect(plate.dataset.clipStart).toBe('5');
   });
@@ -354,7 +427,8 @@ describe('initCardPool — media plates carry their class and clip window', () =
     window.audioObjects = { [TEST_AUDIO_ID]: 'mp3' };
     buildStory([{ step: '1', object: TEST_AUDIO_ID, question: 'Q', answer: 'A' }]);
 
-    const plate = state.viewerPlates[1];
+    expect(state.viewerPlates[1]).toBeInstanceOf(AudioPlate);
+    const plate = state.viewerPlates[1].container;
     expect(plate.classList.contains('audio-plate')).toBe(true);
     expect(plate.dataset.cardType).toBe('audio');
   });
@@ -362,7 +436,8 @@ describe('initCardPool — media plates carry their class and clip window', () =
   it('leaves an image scene with neither media class', () => {
     buildStory([{ step: '1', object: 'obj-a', question: 'Q', answer: 'A', clip_start: '12' }]);
 
-    const plate = state.viewerPlates[1];
+    expect(state.viewerPlates[1]).toBeInstanceOf(IiifPlate);
+    const plate = state.viewerPlates[1].container;
     expect(plate.classList.contains('video-plate')).toBe(false);
     expect(plate.classList.contains('audio-plate')).toBe(false);
     expect(plate.dataset.cardType).toBe('iiif');
@@ -392,10 +467,10 @@ describe('activateCard — the plate label follows the step', () => {
     state.scrollDriven = true;
 
     activateCard(1, 'forward');
-    expect(state.viewerPlates[1].getAttribute('aria-label')).toBe('The full sheet');
+    expect(state.viewerPlates[1].container.getAttribute('aria-label')).toBe('The full sheet');
 
     activateCard(2, 'forward');
-    expect(state.viewerPlates[1].getAttribute('aria-label')).toBe('The cartouche');
+    expect(state.viewerPlates[1].container.getAttribute('aria-label')).toBe('The cartouche');
 
     state.scrollDriven = false;
   });
@@ -407,7 +482,7 @@ describe('activateCard — the plate label follows the step', () => {
     state.scrollDriven = true;
 
     activateCard(1, 'forward');
-    expect(state.viewerPlates[1].getAttribute('aria-label')).toBe('Mapa de la provincia');
+    expect(state.viewerPlates[1].container.getAttribute('aria-label')).toBe('Mapa de la provincia');
 
     state.scrollDriven = false;
   });
@@ -435,29 +510,31 @@ describe('activateCard — framing waits on a viewer that is not ready', () => {
       { step: '2', object: 'obj-a', question: 'Q2', answer: 'A2',
         x: '0.4', y: '0.6', zoom: '4' },
     ]);
-    const viewerCard = { sceneIndex: 1, objectId: 'obj-a', element: state.viewerPlates[1],
-                         isReady: false, pendingZoom: null };
-    state.viewerCards = [viewerCard];
+    const plate = state.viewerPlates[1];
+    plate.osdWrapper = {};   // built, so the step frames it rather than rebuilding
+    plate.isReady = false;   // and not ready, so the framing is queued
     state.currentObjectRun = { objectId: 'obj-a', runPosition: 0 };
 
     activateCard(2, 'forward');
 
-    expect(viewerCard.pendingZoom).toEqual({ x: 0.4, y: 0.6, zoom: 4, snap: false });
+    expect(plate.pendingZoom).toEqual({ x: 0.4, y: 0.6, zoom: 4, snap: false });
   });
 
-  it('leaves the viewer alone for a step that authored no framing', () => {
+  it('queues the whole-object framing for a step that authored none', () => {
     buildStory([
       { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
       { step: '2', object: 'obj-a', question: 'Q2', answer: 'A2' },
     ]);
-    const viewerCard = { sceneIndex: 1, objectId: 'obj-a', element: state.viewerPlates[1],
-                         isReady: false, pendingZoom: null };
-    state.viewerCards = [viewerCard];
+    const plate = state.viewerPlates[1];
+    plate.osdWrapper = {};
+    plate.isReady = false;
     state.currentObjectRun = { objectId: 'obj-a', runPosition: 0 };
 
     activateCard(2, 'forward');
 
-    expect(viewerCard.pendingZoom).toBeNull();
+    // The whole object is a framing like any other: image centre, zoom 1, which
+    // the focal target resolves to the whole image fit in the uncovered region.
+    expect(plate.pendingZoom).toEqual({ x: 0.5, y: 0.5, zoom: 1, snap: false });
   });
 });
 
@@ -481,10 +558,10 @@ describe('setCardProgress — the arriving plate slides with the scrub', () => {
     document.querySelector('.card-stack').classList.add('is-scrubbing');
 
     setCardProgress(1, 0.25);
-    expect(state.viewerPlates[2].style.transform).toBe('translateY(75%)');
+    expect(state.viewerPlates[2].container.style.transform).toBe('translateY(75%)');
 
     setCardProgress(1, 0.75);
-    expect(state.viewerPlates[2].style.transform).toBe('translateY(25%)');
+    expect(state.viewerPlates[2].container.style.transform).toBe('translateY(25%)');
   });
 
   it('takes the current plate away upward when the next step is a title card', () => {
@@ -495,19 +572,60 @@ describe('setCardProgress — the arriving plate slides with the scrub', () => {
     document.querySelector('.card-stack').classList.add('is-scrubbing');
 
     setCardProgress(1, 0.25);
-    expect(state.viewerPlates[1].style.transform).toBe('translateY(-25%)');
+    expect(state.viewerPlates[1].container.style.transform).toBe('translateY(-25%)');
   });
 
-  it('moves no plate while both steps share an object', () => {
+  it('holds the standing plate at rest while both steps share an object', () => {
     buildStory([
       { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
       { step: '2', object: 'obj-a', question: 'Q2', answer: 'A2' },
     ]);
     document.querySelector('.card-stack').classList.add('is-scrubbing');
-    state.viewerPlates[1].style.transform = 'translateY(0)';
 
     setCardProgress(1, 0.25);
-    expect(state.viewerPlates[1].style.transform).toBe('translateY(0)');
+    expect(state.viewerPlates[1].container.style.transform).toBe('translateY(0%)');
+  });
+
+  it('states the plate behind a section card as clear of the top', () => {
+    // The position rests on the section card, so the pair in play is the
+    // section and the object after it. Nothing in that pair is the plate the
+    // section card is covering, which is the one the reader sees again on the
+    // way back — and which a scrub that stopped short leaves part way up.
+    buildStory([
+      { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
+      { step: '2', object: '',      question: 'Interlude', answer: '' },
+      { step: '3', object: 'obj-b', question: 'Q3', answer: 'A3' },
+    ]);
+    document.querySelector('.card-stack').classList.add('is-scrubbing');
+    state.viewerPlates[1].container.style.transform = 'translateY(-34%)';
+
+    setCardProgress(2, 0);
+    expect(state.viewerPlates[1].container.style.transform).toBe('translateY(-100%)');
+    expect(state.viewerPlates[3].container.style.transform).toBe('translateY(100%)');
+  });
+
+  it('brings the next plate up out of a section card', () => {
+    buildStory([
+      { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
+      { step: '2', object: 'obj-b', question: 'Q2', answer: 'A2' },
+    ]);
+    document.querySelector('.card-stack').classList.add('is-scrubbing');
+
+    // Step 0 is the fixture's own section card, so the position is leaving one.
+    setCardProgress(0, 0.25);
+    expect(state.viewerPlates[1].container.style.transform).toBe('translateY(75%)');
+  });
+
+  it('holds the plates below while the intro gives way to a section card', () => {
+    buildStory([
+      { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
+    ]);
+    document.querySelector('.card-stack').classList.add('is-scrubbing');
+
+    // Nothing rises over the intro but the section card itself, which is a
+    // card and not a plate; the first object's plate waits a viewport down.
+    setCardProgress(-1, 0.25);
+    expect(state.viewerPlates[1].container.style.transform).toBe('translateY(100%)');
   });
 });
 
@@ -535,7 +653,7 @@ describe('card pool — a video plate is handed over through the video module', 
 
     activateCard(2, 'forward');
 
-    expect(vi.mocked(deactivateVideoCard)).toHaveBeenCalledWith(state.viewerPlates[1]);
+    expect(vi.mocked(deactivateVideoCard)).toHaveBeenCalledWith(state.viewerPlates[1].container);
   });
 
   it('re-clips the running player for a later step in the same scene', () => {
@@ -550,12 +668,16 @@ describe('card pool — a video plate is handed over through the video module', 
     activateCard(2, 'forward');
 
     expect(vi.mocked(updateVideoClip)).toHaveBeenCalledWith(
-      state.viewerPlates[1], 90, 120, true);
+      state.viewerPlates[1].container, 90, 120, true);
   });
 });
 
 describe('card pool — the viewer pool stays inside its cap', () => {
   let savedCap;
+
+  /** The plates holding a live viewer, which is what the cap counts. */
+  const loadedViewers = () => Object.values(state.viewerPlates)
+    .filter(plate => plate instanceof IiifPlate && plate.osdWrapper);
 
   beforeEach(() => {
     resetPoolState();
@@ -589,7 +711,7 @@ describe('card pool — the viewer pool stays inside its cap', () => {
 
     activateCard(1, 'forward');
 
-    expect(state.viewerCards.length).toBe(2);
+    expect(loadedViewers().length).toBe(2);
     state.scrollDriven = false;
   });
 
@@ -607,7 +729,7 @@ describe('card pool — the viewer pool stays inside its cap', () => {
 
     // Warming runs outward from the active scene, so the survivors are the
     // last two opened and the pool never holds a scene farther than those.
-    const scenes = state.viewerCards.map(vc => vc.sceneIndex).sort((a, b) => a - b);
+    const scenes = loadedViewers().map(plate => plate.sceneIndex).sort((a, b) => a - b);
     expect(scenes).toEqual([3, 4]);
     state.scrollDriven = false;
   });
@@ -635,7 +757,7 @@ describe('initCardPool — the first scene player opens at its scene z-index', (
     initCardPool({ steps }, {});
 
     const expected = String(computeZIndexPlan(steps).plateZ[0]);
-    expect(state.viewerPlates[0].style.zIndex).toBe(expected);
+    expect(state.viewerPlates[0].container.style.zIndex).toBe(expected);
   });
 });
 
@@ -651,22 +773,111 @@ describe('activateCard — a mode flip on one object re-seats the plate it share
     resetPoolState();
   });
 
-  it('shows the shared plate rather than panning the viewer inside it', () => {
+  it('keeps the shared plate on screen and sends it the step framing', () => {
     buildStory([
       { step: '1', object: 'obj-a', question: 'Q1', answer: 'A1' },
       { step: '2', object: 'obj-a', question: 'Q2', answer: 'A2',
         x: '0.4', y: '0.6', zoom: '4' },
     ]);
-    const plate = state.viewerPlates[1];
-    const viewerCard = { sceneIndex: 1, objectId: 'obj-a', element: plate,
-                         isReady: false, pendingZoom: null };
-    state.viewerCards = [viewerCard];
+    const viewerCard = state.viewerPlates[1];
+    viewerCard.osdWrapper = {};
+    viewerCard.isReady = false;
+    const plate = viewerCard.container;
     state.currentObjectRun = { objectId: 'obj-a', runPosition: 0 };
 
     activateCard(2, 'forward');
 
     expect(plate.classList.contains('is-active')).toBe(true);
     expect(plate.style.transform).toBe('translateY(0)');
-    expect(viewerCard.pendingZoom).toBeNull();
+    // The plate stays put, and the step's framing still reaches the viewer —
+    // queued here because this viewer card is not ready yet.
+    expect(viewerCard.pendingZoom).toEqual({ x: 0.4, y: 0.6, zoom: 4, snap: true });
+  });
+});
+
+// ── reconcilePlatesForJump ───────────────────────────────────────────────────
+//
+// A jump used to close the plates it crossed by removing `is-active`. That
+// class carries `translateY(0)`, and so does the inline style every path
+// writes when it opens a plate — so removing the class left the inline
+// transform holding the plate open, and the plate stayed exactly where the
+// walk had put it. Invisible wherever the target's plate covered it, and
+// across the whole screen where it did not.
+
+describe('reconcilePlatesForJump — closing the plates a jump crossed', () => {
+  // A plate as _createViewerPlates builds one: an instance of the class its
+  // card type selects, over an element carrying that type. What decides
+  // whether a plate holds a player is the class of the instance, so a fixture
+  // that is only a styled element is a plate the framework never produces.
+  const CARD_TYPE_FOR = new Map([
+    [AudioPlate, 'audio'],
+    [VideoPlate, 'youtube'],
+    [IiifPlate,  'iiif'],
+  ]);
+
+  function plate(PlateClass = IiifPlate) {
+    const el = document.createElement('div');
+    el.className = 'viewer-plate';
+    el.dataset.cardType = CARD_TYPE_FOR.get(PlateClass);
+    const p = new PlateClass(el, 'obj', 0, 0);
+    el.classList.add('is-active');
+    el.style.transform = 'translateY(0)';   // as a walk onto it left it
+    return p;
+  }
+
+  beforeEach(() => {
+    state.stepToScene = { 0: 0, 1: 1, 2: 2 };
+    state.viewerPlates = {};
+  });
+
+  it('sends a plate the reader walked onto off screen, not just inactive', () => {
+    const crossed = plate();
+    state.viewerPlates = { 0: crossed, 1: plate() };
+
+    reconcilePlatesForJump(1);
+
+    expect(crossed.container.style.transform).toBe('translateY(100%)');
+    expect(crossed.container.classList.contains('is-active')).toBe(false);
+  });
+
+  it('leaves the target step own plate alone for activateCard to place', () => {
+    const target = plate();
+    state.viewerPlates = { 0: plate(), 1: target };
+
+    reconcilePlatesForJump(1);
+
+    expect(target.container.style.transform).toBe('translateY(0)');
+    expect(target.container.classList.contains('is-active')).toBe(true);
+  });
+
+  it('closes an audio plate the jump goes back across', () => {
+    // The case this was filed for: step 9 is audio, the reader jumps to step 5.
+    const audio = plate(AudioPlate);
+    state.stepToScene = { 4: 1, 8: 2 };
+    state.viewerPlates = { 1: plate(), 2: audio };
+
+    reconcilePlatesForJump(4);
+
+    expect(audio.container.style.transform).toBe('translateY(100%)');
+  });
+
+  it('stands the media down, as the walk it stands in for does', () => {
+    const video = plate(VideoPlate);
+    state.stepToScene = { 0: 0, 1: 1 };
+    state.viewerPlates = { 0: plate(), 1: video };
+    deactivateVideoCard.mockClear();
+
+    reconcilePlatesForJump(0);
+
+    expect(deactivateVideoCard).toHaveBeenCalledWith(video.container);
+  });
+
+  it('puts the transitions back, so the next move animates', () => {
+    const crossed = plate();
+    state.viewerPlates = { 0: crossed, 1: plate() };
+
+    reconcilePlatesForJump(1);
+
+    expect(crossed.container.style.transition).toBe('');
   });
 });

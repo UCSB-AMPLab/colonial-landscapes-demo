@@ -7,7 +7,7 @@
  * wiring with a stubbed wrapper. A browser smoke covers the rest against a
  * served build.
  *
- * @version v1.7.0
+ * @version v1.8.0
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -36,11 +36,11 @@ vi.mock('../../assets/js/telar-story/iiif-viewer.js', () => {
   };
 });
 
-import { readObjectData, publishLanguageGlobals, initObjectPage } from '../../assets/js/object-page/main.js';
+import { readObjectData, publishLanguageGlobals, onObjectPage } from '../../assets/js/object-page/boot.js';
 import { copyWithFeedback, CHECK_ICON } from '../../assets/js/object-page/copy-feedback.js';
 import { initClipPanelToggle, initClipCopyButtons } from '../../assets/js/object-page/clip-panel.js';
 import { videoProvider, initVideoEmbed, initClipPicker, initCopyEmbedUrl } from '../../assets/js/object-page/video-object.js';
-import { formatTime, findAudioUrl, controlsMarkup } from '../../assets/js/object-page/audio-object.js';
+import { formatTime, controlsMarkup, initAudioPlayer } from '../../assets/js/object-page/audio-object.js';
 import { manifestUrlFor, initImageViewer, initCoordinatePanel } from '../../assets/js/object-page/image-object.js';
 import { IiifViewer } from '../../assets/js/telar-story/iiif-viewer.js';
 
@@ -69,7 +69,7 @@ beforeEach(() => {
     configurable: true,
     value: { writeText: (text) => { clipboard.push(text); return Promise.resolve(); } },
   });
-  window.telarObjectTheme = { applyPanelContrastClass: vi.fn(), deriveThemeColors: vi.fn() };
+  window.telarObjectTheme = { deriveThemeColors: vi.fn() };
   vi.useFakeTimers();
 });
 
@@ -141,7 +141,6 @@ describe('clip panel', () => {
     expect(document.getElementById('clipPickerButton').style.display).toBe('none');
     document.getElementById('clipPanel').dispatchEvent(new Event('hide.bs.collapse'));
     expect(document.getElementById('clipPickerButton').style.display).toBe('block');
-    expect(window.telarObjectTheme.applyPanelContrastClass).toHaveBeenCalledWith(document.querySelector('.clip-panel'));
   });
 
   it('copies the clip as CSV and as tab-separated text', async () => {
@@ -268,15 +267,66 @@ describe('audio helpers', () => {
     expect(formatTime(141.596)).toBe('2:21');
   });
 
-  it('tries the extensions in order and takes the first the server answers for', async () => {
+  it('says so and asks the network for nothing when the build named no file', async () => {
+    document.body.innerHTML = '<div id="object-viewer"></div>';
     const asked = [];
-    const fetchFn = async (url) => { asked.push(url); return { ok: url.endsWith('.ogg') }; };
-    expect(await findAudioUrl('/telar', 'cusb', fetchFn)).toBe('/telar/telar-content/objects/cusb.ogg');
-    expect(asked).toEqual(['/telar/telar-content/objects/cusb.mp3', '/telar/telar-content/objects/cusb.ogg']);
+    const realFetch = global.fetch;
+    global.fetch = async (url) => { asked.push(url); return { ok: false }; };
+    try {
+      await initAudioPlayer(data({ mediaType: 'Audio', audioUrl: '' }));
+    } finally {
+      global.fetch = realFetch;
+    }
+    expect(document.getElementById('object-viewer').textContent)
+      .toContain('Audio file not available.');
+    expect(asked).toEqual([]);
   });
 
-  it('is null when nothing answers, and a failed request is not an answer', async () => {
-    expect(await findAudioUrl('/t', 'x', async () => { throw new Error('offline'); })).toBeNull();
+  describe('peaks', () => {
+    // Stands in for WaveSurfer: records the options it was created with and
+    // answers every call the player makes with something that accepts more.
+    const inert = () => new Proxy(function () {}, {
+      get: (_t, key) => (key === 'then' ? undefined : inert()),
+      apply: () => inert(),
+    });
+    let created;
+    let asked;
+    let realFetch;
+
+    beforeEach(() => {
+      document.body.innerHTML = '<div id="object-viewer"></div>';
+      created = null;
+      asked = [];
+      realFetch = global.fetch;
+      global.fetch = async (url) => {
+        asked.push(url);
+        return { ok: true, json: async () => ({ peaks: [0.1, 0.5] }) };
+      };
+      window.telarLoadWaveSurfer = async () => {};
+      window.telarObjectTheme = { deriveThemeColors: () => ({}) };
+      window.WaveSurfer = { create: (opts) => { created = opts; return inert(); }, Regions: inert() };
+    });
+
+    afterEach(() => {
+      global.fetch = realFetch;
+      delete window.telarLoadWaveSurfer;
+      delete window.telarObjectTheme;
+      delete window.WaveSurfer;
+      delete window._objectPageWaveSurfer;
+    });
+
+    it('asks for nothing when the build has no peaks file, and lets WaveSurfer decode', async () => {
+      await initAudioPlayer(data({ mediaType: 'Audio', audioUrl: '/t/a.mp3', peaksUrl: '' }));
+      expect(asked).toEqual([]);
+      expect(created.url).toBe('/t/a.mp3');
+      expect(created.peaks).toBeUndefined();
+    });
+
+    it('fetches the peaks file the build named and hands its peaks to WaveSurfer', async () => {
+      await initAudioPlayer(data({ mediaType: 'Audio', audioUrl: '/t/a.mp3', peaksUrl: '/t/assets/audio/peaks/a.json' }));
+      expect(asked).toEqual(['/t/assets/audio/peaks/a.json']);
+      expect(created.peaks).toEqual([0.1, 0.5]);
+    });
   });
 
   it('renders the three controls with their labels', () => {
@@ -400,23 +450,34 @@ describe('initCoordinatePanel', () => {
   });
 });
 
-// ── Dispatch ────────────────────────────────────────────────────────────────
+// ── Boot ────────────────────────────────────────────────────────────────────
 
-describe('initObjectPage', () => {
-  it('wires an audio page: the player and the clip panel, and no viewer', async () => {
-    document.body.innerHTML = '<div id="object-viewer"></div><div id="clipPanel" class="clip-panel"></div><div id="clipPickerButton"></div>';
-    vi.stubGlobal('fetch', async () => ({ ok: false }));
-    IiifViewer.last = null;
-    initObjectPage(data({ mediaType: 'Audio' }));
-    await flush(); await flush(); await flush(); await flush();
-    expect(document.getElementById('object-viewer').textContent).toContain('Audio file not available.');
-    expect(IiifViewer.last).toBeNull();
-    vi.unstubAllGlobals();
+// Which type gets wired is the layout's decision now, not this module's: it
+// loads one bundle per media type, so a page carries only its own entry. What
+// is left here is the part every entry shares.
+describe('onObjectPage', () => {
+  it('runs the entry with the page data', () => {
+    document.body.innerHTML =
+      '<script id="telar-object-data" type="application/json">{"mediaType":"Audio","objectId":"a"}</script>';
+    const seen = [];
+    onObjectPage((d) => seen.push(d));
+    expect(seen).toEqual([{ mediaType: 'Audio', objectId: 'a' }]);
   });
 
-  it('wires nothing for a media type it does not know', () => {
+  it('does nothing at all on a page the layout wrote no block into', () => {
+    // A bundle that reached a page it is not for. Silence, not an error.
     document.body.innerHTML = '<div id="object-viewer">untouched</div>';
-    initObjectPage(data({ mediaType: '3D' }));
+    const seen = [];
+    onObjectPage((d) => seen.push(d));
+    expect(seen).toEqual([]);
     expect(document.getElementById('object-viewer').textContent).toBe('untouched');
+  });
+
+  it('does nothing when the block is there but unreadable', () => {
+    document.body.innerHTML =
+      '<script id="telar-object-data" type="application/json">{nope</script>';
+    const seen = [];
+    onObjectPage((d) => seen.push(d));
+    expect(seen).toEqual([]);
   });
 });

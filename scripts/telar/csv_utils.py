@@ -40,7 +40,7 @@ rename of the gallery classification column from `object_type` to `medium`
 — with backward-compatible aliases (`tipo_objeto`, `medium_genre`,
 `medio_genero`) so existing spreadsheets continue to work without changes.
 
-Version: v1.6.0
+Version: v1.8.0
 """
 
 from pathlib import Path
@@ -48,13 +48,34 @@ from pathlib import Path
 import pandas as pd
 
 
-# Canonical set of local image/document extensions, shared by the objects and
-# stories processors. Single source of truth so the extension lists used for
-# reference-stripping and on-disk existence checks can no longer drift (a
-# `.bmp`/`.svg` object used to strip correctly but fail the existence check).
-IMAGE_EXTENSIONS = frozenset({
-    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.tif', '.tiff', '.bmp', '.svg', '.pdf',
-})
+# Canonical local image/document extensions, shared by the CSV processors and
+# the tile generator. Every list of image extensions in the build derives from
+# this one: a processor that recognises a file the tiler never searches for
+# produces an object that validates and has no image.
+#
+# Ordered, because the tiler takes the first extension matching an object id and
+# several files can share a stem. The order is the tiler's existing priority, so
+# which file a site already tiles does not change.
+#
+# The Telar Compositor pins its own upload allowlist against this tuple, so the
+# name and the literal shape are load-bearing outside this repository: an author
+# must not be able to upload a file the build cannot tile, or hold a file in
+# their repository that the Compositor refuses. Widening the set here is what
+# lets the Compositor widen; renaming it or building it dynamically breaks a
+# check that runs at their release gate.
+IMAGE_EXTENSIONS_ORDERED = (
+    '.jpg', '.jpeg', '.png', '.heic', '.heif', '.webp', '.tif', '.tiff', '.pdf',
+    '.gif', '.bmp', '.svg',
+)
+
+# Membership form, for reference-stripping and on-disk existence checks.
+IMAGE_EXTENSIONS = frozenset(IMAGE_EXTENSIONS_ORDERED)
+
+# Rendered by MuPDF rather than decoded by Pillow. Both describe a document
+# rather than a grid of pixels, so the build chooses a resolution for them:
+# process_pdf.py renders a PDF page at 200 DPI, and iiif_utils rasterises an SVG
+# to a fixed longest side. Everything else is decoded at its own size.
+PYMUPDF_EXTENSIONS = frozenset({'.pdf', '.svg'})
 
 
 def build_stem_index(directory):
@@ -114,13 +135,16 @@ COLUMN_NAME_MAPPING = {
     'id_objeto': 'object_id',
     'titulo': 'title',
     'descripcion': 'description',
+    'descripción': 'description',
     'url_fuente': 'source_url',
     'creador': 'creator',
     'periodo': 'period',
     'medio': 'medium',
     'dimensiones': 'dimensions',
     'ubicacion': 'source',
+    'ubicación': 'source',
     'credito': 'credit',
+    'crédito': 'credit',
     'miniatura': 'thumbnail',
     # v0.8.0 gallery filtering columns
     'año': 'year',
@@ -142,10 +166,18 @@ COLUMN_NAME_MAPPING = {
     'orden': 'order',
     'id_historia': 'story_id',
     'subtitulo': 'subtitle',
+    'subtítulo': 'subtitle',
     'firma': 'byline',
+    # Both words in both genders. A header this table does not carry yields
+    # nothing to `row.get('protected', '')`, so the story is never marked
+    # protected and publishes in the clear — and the interlock that refuses
+    # such a build acts on stories already recognised as protected, so it
+    # cannot fire either.
     'private': 'protected',
     'privada': 'protected',
+    'privado': 'protected',
     'protegida': 'protected',
+    'protegido': 'protected',
     'mostrar_secciones': 'show_sections',
 
     # Glossary columns (Spanish -> English)
@@ -233,10 +265,72 @@ def get_source_url(row):
     return ''
 
 
-def normalize_column_names(df):
+OBJECT_FIELDS = {
+    'object_id', 'title', 'creator', 'period', 'medium', 'dimensions',
+    'location', 'credit', 'thumbnail', 'iiif_manifest', 'source_url',
+    'source', 'object_warning', 'object_warning_short', 'year',
+    'object_type', 'subjects', 'is_featured_sample', '_demo',
+    'description', 'featured', 'alt_text',
+    # Auto-detected media type and audio metadata. Nothing writes
+    # audio_duration: it stays reserved, so a column of that name is not shown
+    # as custom metadata, while the Compositor's FRAMEWORK_OBJECT_FIELDS holds
+    # it. Its tests/import.server.test.ts reads this set and must agree.
+    'media_type', 'audio_duration', 'audio_filesize', 'audio_format',
+}
+
+
+# Columns whose cells are read as the author typed them. pandas infers a
+# column's dtype from the whole column, so a cell's meaning would otherwise
+# depend on what its neighbours contain: `1` in a numeric column with a blank
+# cell arrives as "1.0" and misses the vocabulary a flag is matched against,
+# while the same `1` in a column with no blank arrives as "1" and matches; and
+# a year typed as 1890 is published as "1890.0" on the strength of a blank
+# cell in another row. The two cases differ in where the damage lands — a flag
+# fails to match, a year is published wrong — and have the same cause, so they
+# have the same remedy.
+#
+# An object id is the third kind: it is a key, matched across two sheets that
+# pandas reads separately and can therefore infer differently from each other,
+# so a numeric id could be `1` in one sheet and "1.0" in the other and a step
+# would lose the object it names. Read as text, both sides hold what the
+# author typed, and a step naming something the site does not have is reported
+# by the reference check rather than silently losing its image.
+TEXT_COLUMNS = frozenset({'featured', 'year', 'object_id', 'object'})
+
+
+def text_column_dtypes():
+    """The pandas dtype map pinning `TEXT_COLUMNS` to text.
+
+    Keyed on the headers as authors write them, English and Spanish alike,
+    because the reader runs before `normalize_column_names()`. pandas ignores
+    keys for columns a given sheet does not have.
+    """
+    headers = set(TEXT_COLUMNS)
+    headers.update(alias for alias, canonical in COLUMN_NAME_MAPPING.items()
+                   if canonical in TEXT_COLUMNS)
+    return {header: str for header in headers}
+
+
+def normalize_column_names(df, canonical_fields=None):
     """
     Normalize column names to English using bilingual mapping.
     Supports both English and Spanish column headers (v0.6.0+).
+
+    `canonical_fields` scopes the map to one kind of sheet. The table is
+    shared by every spreadsheet the build reads, so a rule written for the
+    project sheet also renames a column on the objects sheet: an author's
+    own `privado` column — a note that a piece is in a private collection —
+    became `protected`, the name the project sheet uses to mean "encrypt
+    this story". Nothing reads `protected` on an object, so it landed in
+    `extra_metadata`, where the object layout prints the key as the label:
+    a Spanish site showing an English heading the author never wrote.
+
+    The set is the canonical names that sheet's own consumer reads, so it
+    is derived from the thing it describes rather than listed by hand. A
+    rename whose target is not in it is skipped, which leaves the author's
+    own header in place — the safe direction, because the name they typed
+    is the name they meant. Pass None to apply the whole map, which is the
+    behaviour for every sheet not yet scoped.
 
     Args:
         df: pandas DataFrame with potentially Spanish column names
@@ -244,19 +338,146 @@ def normalize_column_names(df):
     Returns:
         DataFrame: DataFrame with normalized (English) column names
     """
+    _refuse_reserved_columns(df)
+
     # Create a mapping for this dataframe's columns
     rename_map = {}
     for col in df.columns:
         col_lower = col.lower().strip()
+        if (canonical_fields is not None
+                and COLUMN_NAME_MAPPING.get(col_lower) not in canonical_fields):
+            continue
         if col_lower in COLUMN_NAME_MAPPING:
             rename_map[col] = COLUMN_NAME_MAPPING[col_lower]
             print(f"  [INFO] Normalized column '{col}' -> '{COLUMN_NAME_MAPPING[col_lower]}'")
+
+    _refuse_colliding_renames(df, rename_map)
 
     # Rename columns if any mappings found
     if rename_map:
         df = df.rename(columns=rename_map)
 
     return df
+
+
+class ColumnCollisionError(ValueError):
+    """Two of a sheet's columns claim one canonical name."""
+
+
+# Names the build writes into a record itself, which a spreadsheet must
+# therefore not also write. `_metadata` is the synthetic first element
+# `csv_to_json` prepends to a story's JSON to carry viewer warnings and the
+# LaTeX flag; every consumer -- the shared story-steps include, four places
+# in story.html, five JavaScript modules, the encryptor's sentinel harvest
+# -- identifies that element by this key alone.
+RESERVED_COLUMN_NAMES = frozenset({'_metadata'})
+
+
+class ReservedColumnError(ValueError):
+    """A spreadsheet declares a column name the build reserves for itself."""
+
+
+def _refuse_reserved_columns(df):
+    """Refuse a sheet that writes a name only the build is meant to write.
+
+    A story sheet carrying a column called `_metadata` produces rows with
+    that key, and every consumer reads such a row as the synthetic metadata
+    element rather than as a step: the step is dropped from the published
+    story and the step count drops to match, so nothing looks wrong. The
+    author is told nothing.
+
+    The name is load-bearing beyond story steps, so the refusal is not
+    narrowed to the sheets the sentinel lives on. `telar/demo.py` collects
+    the ids already in `objects.json` by filtering the same key, so an
+    objects sheet carrying the column empties that set and the demo merge
+    stops seeing the site's own objects -- it adds every demo object,
+    including ones whose id the owner is already using.
+
+    Refusing is the whole fix, and the alternatives are worse in a way
+    worth recording. Hiding the collision behind a name harder to type only
+    raises the cost of forging it -- whatever a spreadsheet cannot produce,
+    a CSV committed by hand still can, because the decoder and the parser
+    both pass bytes through. Stripping the column instead would delete the
+    author's own data on a name match, and a remover is what destroys
+    content when its sentinel is forged. This adds nothing to the file and
+    removes nothing from it; it stops and says which column to rename.
+    """
+    reserved = sorted({str(col) for col in df.columns
+                       if str(col).lower().strip() in RESERVED_COLUMN_NAMES})
+    if not reserved:
+        return
+
+    named = ', '.join(repr(col) for col in reserved)
+    raise ReservedColumnError(
+        f"This spreadsheet has a column Telar uses for itself: {named}. "
+        "A row in that column is read as Telar's own bookkeeping rather "
+        "than as your content, so the row would disappear from the "
+        "published site without any warning. Rename the column and rebuild."
+    )
+
+
+def _refuse_colliding_renames(df, rename_map):
+    """Refuse a rename that would put two columns under one name.
+
+    A sheet headed both `privado` and `protected`, or both `fuente` and
+    `location`, leaves pandas holding two columns of the same name. Every
+    consumer then reads a Series where it expects a value: `row.get('protected')`
+    returns both cells, and the truth test at the far end raises
+    "The truth value of a Series is ambiguous" — a message that says nothing
+    about the spreadsheet the author has to fix.
+
+    Refusing here fails just as closed and names the two columns, which is the
+    only part the author can act on. There is no safe way to guess which column
+    was meant: for `protected` the two answers are publish and do not publish.
+
+    Two spellings of one header collide on the same terms. Every lookup
+    downstream folds case and trims, so `Note` beside `note` is one column
+    written twice and pandas holds both under one label again. Grouping the
+    sheet's own columns rather than the rename map is what sees it: a caller
+    that folded its headers before calling leaves two identical labels, and
+    a map keyed by label collapses those into a single entry.
+    """
+    claimed = {}
+    for col in df.columns:
+        canonical = rename_map.get(col, str(col).lower().strip())
+        claimed.setdefault(canonical, []).append(str(col))
+
+    collisions = []
+    for canonical, sources in sorted(claimed.items()):
+        if len(sources) > 1:
+            collisions.append((canonical, sorted(sources)))
+
+    if collisions:
+        detail = '; '.join(
+            f"'{canonical}' is claimed by {', '.join(repr(c) for c in cols)}"
+            for canonical, cols in collisions)
+        raise ColumnCollisionError(
+            f"Two columns in this spreadsheet mean the same thing: {detail}. "
+            "Keep one of each and remove the other, then rebuild. If this "
+            "site is edited in the Compositor, publish it again from there "
+            "instead: a current Compositor writes one column for each, and "
+            "this file is not one to edit by hand."
+        )
+
+
+# Column spellings a published sheet may still carry after the column itself
+# was removed. They are NOT aliases: nothing renames to them and no processor
+# reads them. They exist so `is_header_row` still recognises a header row that
+# names one, because that check scores a row against the column vocabulary and
+# a spelling missing from it drags the whole row's score down.
+#
+# `quoted_in_stories` and its two Spanish spellings shipped in the 1.8.0 test
+# instance and in a Compositor beta between 13 and 17 September 2026, then were
+# removed with the glossary acknowledgement. A four-column glossary header
+# carrying one of them scores 3/4 -- below the 0.8 threshold -- so the bilingual
+# Spanish row was read as a glossary term titled `titulo`. This is the TEL-180
+# defect by a different route, and the reason this set can only grow: a column
+# can leave the vocabulary, but a sheet already published with it cannot.
+LEGACY_HEADER_SPELLINGS = frozenset({
+    'quoted_in_stories',
+    'citado_en_historias',
+    'citada_en_historias',
+})
 
 
 def is_header_row(row_values):
@@ -275,15 +496,27 @@ def is_header_row(row_values):
     # Also include common column names not in the mapping
     valid_names.update(['x', 'y', 'zoom'])
 
+    # And spellings a published sheet may carry for a column since removed.
+    valid_names.update(LEGACY_HEADER_SPELLINGS)
+
     # Count how many cells match known column names
+    # A blank cell is absent however the file was read. A sheet read with
+    # `keep_default_na=False` -- which the glossary and object readers do, so
+    # a term titled `NA` survives -- gives '' where an inferring read gives
+    # NaN, and counting '' as populated made the verdict depend on which
+    # reader got there: a bilingual header row of three names padded with two
+    # empty custom columns fell from 100% to 60% and was published as data.
     matches = 0
     total = 0
     for val in row_values:
-        if pd.notna(val):
-            val_lower = str(val).lower().strip()
-            total += 1
-            if val_lower in valid_names:
-                matches += 1
+        if pd.isna(val):
+            continue
+        val_lower = str(val).lower().strip()
+        if not val_lower:
+            continue
+        total += 1
+        if val_lower in valid_names:
+            matches += 1
 
     # If 80%+ of non-empty cells are column names, it's a header row.
     # Require at least 3 non-empty cells so a sparse first data row whose two

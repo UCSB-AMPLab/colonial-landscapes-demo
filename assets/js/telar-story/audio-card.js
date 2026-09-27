@@ -41,7 +41,7 @@
  * slower but still functional. Audio load errors inject a .telar-alert
  * notification into the card area.
  *
- * @version v1.6.0
+ * @version v1.8.0
  */
 
 import { state } from './state.js';
@@ -158,6 +158,11 @@ export function formatElapsedTime(seconds) {
  * so they carry their own copy; if you change this derivation, change that
  * one too.
  *
+ * barHex is --color-button-text, not the derived --color-on-button: the bars
+ * are drawn on the accent darkened to 70%, not on the button background, so
+ * the colour derived to be legible on the button ground does not apply here.
+ * On santa-barbara that would put the navy #003660 on a dark teal plate.
+ *
  * @param {string} accentHex - CSS hex colour for --color-link, e.g. '#883C36'
  * @param {string} [barHex='#ffffff'] - CSS hex colour for --color-button-text
  * @returns {Object} Theme colour set
@@ -259,6 +264,28 @@ export function getSharedAudioContext() {
 // ── Player lifecycle ──────────────────────────────────────────────────────────
 
 /**
+ * The plate's one waveform container, made if it is not there yet.
+ *
+ * Decorative and display-only: the bars are a picture of the sound, not a
+ * control, so the container is hidden from assistive technology and takes no
+ * pointer events. Its layout is the stylesheet's, which the mobile query
+ * overrides.
+ *
+ * @param {HTMLElement} plateEl
+ * @returns {HTMLElement}
+ */
+function _ensureWaveformContainer(plateEl) {
+  const existing = plateEl.querySelector(".waveform-container");
+  if (existing) return existing;
+
+  const container = document.createElement("div");
+  container.className = "waveform-container";
+  container.setAttribute("aria-hidden", "true");
+  plateEl.appendChild(container);
+  return container;
+}
+
+/**
  * Create a WaveSurfer audio player inside the given plate element.
  *
  * Loads the vendored WaveSurfer bundle on demand (first call), fetches
@@ -318,6 +345,16 @@ export function createAudioPlayer(plateEl, audioUrl, peaksUrl, options = {}) {
   _audioPlayers.push(wrapper);
   _enforceAudioPoolLimit(sceneIndex);
 
+  // Both callers in card-pool.js decide whether a plate needs a player by
+  // asking whether it already holds this container, so it has to exist by the
+  // time this function returns rather than when the load below resolves. A
+  // guard that tests what its own build creates later cannot turn a second
+  // caller away: preload and activation arrive within milliseconds of each
+  // other when a reader crosses several steps at once, both read an empty
+  // plate, and each WaveSurfer appends its own node into whichever container
+  // the first of them eventually made.
+  const waveContainer = _ensureWaveformContainer(plateEl);
+
   loadWaveSurferAPI()
     .then(() => {
       // The wrapper may have been evicted/destroyed while the vendored-bundle
@@ -344,17 +381,6 @@ export function createAudioPlayer(plateEl, audioUrl, peaksUrl, options = {}) {
         const patternUri = _buildPatternDataUri(colors.patternColor);
         plateEl.style.background = `${colors.backgroundColor} ${patternUri} repeat`;
         plateEl.style.backgroundSize = "20px auto";
-
-        // Create waveform container (display-only)
-        let waveContainer = plateEl.querySelector(".waveform-container");
-        if (!waveContainer) {
-          waveContainer = document.createElement("div");
-          waveContainer.className = "waveform-container";
-          // Layout handled by CSS class — mobile media query overrides position
-          // Set aria-hidden — decorative, not interactive
-          waveContainer.setAttribute("aria-hidden", "true");
-          plateEl.appendChild(waveContainer);
-        }
 
         // Create Regions plugin instance
         const regionsPlugin = window.WaveSurfer.Regions.create();
@@ -708,21 +734,32 @@ export function destroyAudioPlayer(wrapper) {
   const idx = _audioPlayers.indexOf(wrapper);
   if (idx !== -1) _audioPlayers.splice(idx, 1);
 
-  // Clean up DOM elements injected by this module
-  const plateEl = wrapper.element;
-  if (plateEl) {
-    [
-      ".waveform-container",
-      ".audio-controls",
-      ".audio-elapsed",
-      ".audio-play-overlay",
-      ".audio-clip-end-overlay",
-      ".telar-alert",
-    ].forEach((sel) => {
-      const el = plateEl.querySelector(sel);
-      if (el) el.remove();
-    });
-  }
+  _clearPlate(wrapper.element);
+}
+
+/** Everything this module appends to a plate, so both teardowns clear the same set. */
+const _INJECTED_SELECTORS = [
+  ".waveform-container",
+  ".audio-controls",
+  ".audio-elapsed",
+  ".audio-play-overlay",
+  ".audio-clip-end-overlay",
+  ".telar-alert",
+];
+
+/**
+ * Take this module's nodes back out of a plate.
+ *
+ * Both teardowns owe this. An evicted plate that keeps its waveform container
+ * is one the card pool reads as still holding a player, so the scene is never
+ * rebuilt; and if it were, `_ensureWaveformContainer` would hand the new player
+ * the container the dead one left.
+ *
+ * @param {HTMLElement|null} plateEl
+ */
+function _clearPlate(plateEl) {
+  if (!plateEl) return;
+  _INJECTED_SELECTORS.forEach((sel) => plateEl.querySelector(sel)?.remove());
 }
 
 /**
@@ -862,6 +899,8 @@ function _evictAudioPlayer(wrapper) {
   } catch (e) {
     console.warn("_evictAudioPlayer: error during evict", e);
   }
+
+  _clearPlate(wrapper.element);
 }
 
 /**
@@ -872,6 +911,28 @@ function _evictAudioPlayer(wrapper) {
  */
 function _getAudioWrapperForPlate(plateEl) {
   return _audioPlayers.find((w) => w.element === plateEl) || null;
+}
+
+/**
+ * Whether this plate still has a player in the pool.
+ *
+ * The question a caller asks before building one, and the pool is the only
+ * place that can answer it. A plate's DOM is not: the pool is capped, and
+ * eviction destroys the WaveSurfer instance while leaving every node this
+ * module injected, so `.waveform-container` outlives the player it was built
+ * for. A caller testing the DOM sees a container and declines to rebuild.
+ *
+ * True while a build is still in flight, because the wrapper is pooled before
+ * the file loads. Two callers arriving within milliseconds of each other is
+ * the ordinary case when a reader crosses several steps at once, and the
+ * second must be turned away.
+ *
+ * @param {HTMLElement} plateEl
+ * @returns {boolean}
+ */
+export function hasAudioPlayer(plateEl) {
+  const wrapper = _getAudioWrapperForPlate(plateEl);
+  return Boolean(wrapper) && !wrapper._destroyed;
 }
 
 /**

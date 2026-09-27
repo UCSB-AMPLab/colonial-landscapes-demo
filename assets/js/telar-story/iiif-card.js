@@ -29,22 +29,19 @@
  *   Different-object pairs are skipped — the viewer freezes at its last
  *   position while the new plate slides in on top.
  *
- *   Activation/deactivation — `deactivateIiifCard()` handles direction-aware
- *   plate transitions. Forward: the plate stays in place (covered by the next
- *   plate's higher z-index). Backward: the plate slides back down via
- *   translateY(100%).
- *
  *   Destruction — `destroyIiifCard()` releases GPU memory before calling
  *   the wrapper's destroy(). OpenSeadragon holds WebGL render state that
  *   the browser cannot reclaim until the context is explicitly released.
  *   Per OSD issue #2693, the module calls WEBGL_lose_context.loseContext()
  *   first, then the wrapper's destroy(), then removes the DOM element.
  *
- * @version v1.6.0
+ * @version v1.8.0
  */
 
 import { state } from './state.js';
 import { onViewportResize, onLayoutChange, isLandscapeSideCard } from './layout-mode.js';
+import { authoringHomeZoom } from './authoring-frame.js';
+import { stepFraming } from './plates/framing.js';
 
 // ── Type definition ──────────────────────────────────────────────────────────
 
@@ -163,15 +160,12 @@ export function _deriveCardPlacement(cardBox, viewportW, viewportH) {
 
 // ── Two-circle focal-target constants ───────────────────────────────────────
 //
-// Runtime constants for the two-circle centring model.
-// AUTHORING_ASPECT: canonical authoring-viewport aspect ratio — mean of the
-//   Compositor (1.084) and the object-page coord-picker (1.022), giving
-//   symmetric worst-case error of ~3%.
 // FOCAL_DIAMETER_FRAC: focal circle diameter as a fraction of the authored
 //   frame width (0.90 = 90%). Faithful to author framing; low risk of clipping
 //   deliberately-included edge subject matter.
-// These are NOT author-tunable; they are runtime framework constants.
-const AUTHORING_ASPECT    = 1.053;  // canonical authoring-viewport aspect ratio
+// Not author-tunable; a runtime framework constant. The authoring aspect the
+// frame width is derived against lives in `authoring-frame.js`, because the
+// capture side divides by the same number.
 const FOCAL_DIAMETER_FRAC = 0.90;   // focal circle diameter as a fraction of authored frame width
 
 /**
@@ -235,11 +229,17 @@ export function computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placemen
 
   // ── Circle A radius derivation ──────────────────────────────────────────────
   // imageAspect   = imageW / imageH
-  // homeZoomAuth  = imageAspect / AUTHORING_ASPECT  (canonical, device-independent)
+  // homeZoomAuth  = authoringHomeZoom(imageAspect)   (canonical, device-independent)
   // frameWidthImg = imageW / (homeZoomAuth · zoom)   (authored frame width in image px)
   // diameterImg   = FOCAL_DIAMETER_FRAC · frameWidthImg
+  //
+  // The home fit has two arms: an image taller than the authoring frame fits
+  // by height, and a wider one fits by width and cannot zoom out past its own
+  // edges. Keeping only the first arm made every landscape image's authored
+  // frame narrower than it was, by AUTHORING_ASPECT / imageAspect, and so
+  // published it over-zoomed.
   const imageAspect    = imageW / imageH;
-  const homeZoomAuth   = imageAspect / AUTHORING_ASPECT;
+  const homeZoomAuth   = authoringHomeZoom(imageAspect);
   const frameWidthImg  = imageW / (homeZoomAuth * zoom);
   const diameterImg    = FOCAL_DIAMETER_FRAC * frameWidthImg;
 
@@ -254,13 +254,19 @@ export function computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placemen
  *
  * Implements the two-circle model via a transient-zoom-free
  * OSD-unit conversion:
- *   - SCALE: s = max(s_tgt, s_cap) — element px per image px, where
+ *   - SCALE: s = max(s_tgt, s_fit) at zoom ≥ 2 — element px per image px, where
  *       s_tgt = min(region.w, region.h) / diameterImg  (radius match, Circle A→B)
- *       s_cap = min(rect.width/imgW, rect.height/imgH) (Rule A: whole-image fit).
+ *       s_fit = min(region.w/imgW, region.h/imgH)      (Rule A: whole-image fit in
+ *       the uncovered region). At an overview (zoom ≤ 1) s is s_fit scaled by the
+ *       authored zoom: at 1 the whole object fits and is centred in the region,
+ *       and below 1 the same object stands back from the frame by that fraction.
+ *       Between 1 and 2, interpolate linearly from the whole-object fit at 1 to
+ *       the detail scale at 2. This keeps scale continuous without changing
+ *       either overview or zoom ≥ 2 framing.
  *     No OSD-zoom calibration (no `k`): fitBounds derives the zoom from the rect.
  *   - FOCAL: move the focal image point to the uncovered-region centre, clamped to
- *     image bounds (Rule B, _clampFocalPx) — keep scale, drift focal toward the edge
- *     rather than reveal background. Does NOT rely on OSD's visibilityRatio.
+ *     the keep-circle bound (_clampFocalPx) — keep scale, hold the focal at least the
+ *     circle's radius from every region edge. Does NOT rely on OSD's visibilityRatio.
  *   - APPLY: build the image-px rectangle that fills the viewer at scale s with the
  *     focal at the clamped position, then vp.fitBounds(rect, immediate). Because the
  *     target is a rectangle (not a delta off the live zoom), it is correct even on the
@@ -281,19 +287,64 @@ export function computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placemen
  * @returns {boolean} false if skipped (title-card or source dims unavailable), true otherwise.
  */
 
+// The smallest fraction of the whole-object fit an authored zoom can ask for.
+// A tenth of the frame is a long way back and still an object a reader can
+// recognise; below that the step says nothing a reader can act on, and the
+// rectangle handed to OSD approaches degenerate.
+//
+// The Compositor's editor has to let an author reach the same floor, or the
+// range is composable in a spreadsheet and not in the tool most authors use.
+// It is exported with the clamp below so that end can drive this one rather
+// than copy the number out of here.
+export const OVERVIEW_MIN_FRACTION = 0.1;
+
 /**
- * Rule B focal clamp (pure). Given the uncovered `region`, the focal-to-image-edge
- * distances in element px at the applied scale (`edges`), and the `ideal` focal
- * position in element px (the uncovered-region centre), return the focal's target
- * position in element px so the image keeps covering the region.
+ * How much of the whole-object fit an authored zoom at or below an overview
+ * asks for.
  *
- * Requiring the image (focal ± edges) to cover the region gives, per axis:
- *   focal − eLeft  ≤ region.x          and   focal + eRight ≥ region.x + region.w
- * ⇒ focal ∈ [region.x + region.w − eRight, region.x + eLeft]
- * We clamp the ideal (centre) position into that interval. When the image is
- * NARROWER than the region on an axis (eLeft + eRight < region.w) the interval
- * inverts — the image cannot cover the region — so we keep the ideal position
- * (focal at the region centre) on that axis instead of clamping.
+ * 1 is the whole object filling the frame, and below it the same object
+ * standing back with margin around it, down to the floor. Above 1 the
+ * question does not arise: the scale transitions toward the detail rule,
+ * reaching the diameter match (or fit floor) at 2.
+ *
+ * @param {number} zoom - The authored zoom.
+ * @returns {number} A fraction of the whole-object fit, within the floor and 1.
+ */
+export function overviewPullFraction(zoom) {
+  if (!Number.isFinite(zoom)) return 1;
+  return Math.min(1, Math.max(OVERVIEW_MIN_FRACTION, zoom));
+}
+
+/**
+ * Keep-circle focal clamp (pure). Given the uncovered `region`, the focal-to-image-edge
+ * distances in element px at the applied scale (`edges`), the `ideal` focal position in
+ * element px (the uncovered-region centre) and the focal circle's `radius` in element px,
+ * return the focal's target position in element px.
+ *
+ * Two constraints act on each axis, and they pull opposite ways.
+ *
+ *   Coverage. The focal must sit within the image's own edge distance of the region
+ *   edge, or the image does not reach it and the page background shows beside it:
+ *     focal ≤ region.x + eLeft        and    focal ≥ region.x + region.w − eRight
+ *
+ *   Circle. The focal must sit at least the circle's radius inside, or the framed
+ *   detail straddles the region boundary and part of it goes under the text card:
+ *     focal ≥ region.x + radius       and    focal ≤ region.x + region.w − radius
+ *
+ * Both hold together whenever the image is wide enough, which is the ordinary case.
+ * Where they cannot both hold — a focal nearer an image edge than the radius —
+ * **coverage wins**: the focal is held where the image still reaches the region edge,
+ * and the circle is allowed to straddle it.
+ *
+ * That reverses the trade this function was written with, which kept the circle intact
+ * and accepted background at the region edge. Ruled by Juan on 19 September, on the
+ * plain ground that a reader sees a band of background beside the image at once and
+ * does not see a framed detail sitting nearer the region edge than intended.
+ *
+ * Where the image cannot cover the axis at all — an overview, where it is meant to
+ * stand inside the region with margin around it — there is nothing to hold it to and
+ * the ideal position stands. An image exactly as long as the region (zoom 1, on its
+ * limiting axis) covers it, and is placed edge to edge.
  *
  * Note: this returns the target focal POSITION (not a pan delta) and reads no live
  * OSD state, so the apply path is independent of the transient (mid-animation) zoom.
@@ -301,16 +352,37 @@ export function computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placemen
  * @param {{x:number,y:number,w:number,h:number}} region  Uncovered region, element px.
  * @param {{eLeft:number,eRight:number,eTop:number,eBottom:number}} edges  Focal→edge px at applied scale.
  * @param {{x:number,y:number}} ideal   Ideal focal position (the region centre), element px.
+ * @param {number} radius  Focal-circle radius in element px at the applied scale.
  * @returns {{x:number,y:number}} The clamped focal position in element px.
  */
-export function _clampFocalPx(region, edges, ideal) {
-  const loX = region.x + region.w - edges.eRight;  // focal lower bound (cover right edge)
-  const hiX = region.x + edges.eLeft;              // focal upper bound (cover left edge)
-  const loY = region.y + region.h - edges.eBottom;
-  const hiY = region.y + edges.eTop;
+export function _clampFocalPx(region, edges, ideal, radius) {
+  // Bounds that cross by no more than this still count as meeting. At zoom 1 the
+  // image fits the region, so on its limiting axis its length equals the region's
+  // and the two coverage bounds coincide; rounding leaves them apart by about
+  // 1e-13 px at these magnitudes, on either side. A thousandth of a pixel is nine
+  // orders above that and far below a device pixel, so it absorbs the rounding
+  // without letting an image visibly smaller than the region be pinned to one edge.
+  const MEET_PX = 1e-3;
+  const into = (lo, hi, want) =>
+    (lo <= hi + MEET_PX ? Math.max(lo, Math.min(hi, want)) : null);
+
+  const axis = (start, extent, near, far, want) => {
+    const coverLo = start + extent - far;   // the image still reaches the far edge
+    const coverHi = start + near;           // the image still reaches the near edge
+
+    const both = into(Math.max(coverLo, start + radius),
+                      Math.min(coverHi, start + extent - radius), want);
+    if (both !== null) return both;
+
+    const covered = into(coverLo, coverHi, want);
+    if (covered !== null) return covered;
+
+    return want;
+  };
+
   return {
-    x: loX <= hiX ? Math.max(loX, Math.min(hiX, ideal.x)) : ideal.x,
-    y: loY <= hiY ? Math.max(loY, Math.min(hiY, ideal.y)) : ideal.y,
+    x: axis(region.x, region.w, edges.eLeft, edges.eRight, ideal.x),
+    y: axis(region.y, region.h, edges.eTop, edges.eBottom, ideal.y),
   };
 }
 
@@ -344,9 +416,9 @@ function _applyFocalTarget(viewerCard, x, y, zoom, immediate) {
   // the apply path reads NO live OSD zoom. This is what makes it robust on the
   // animate path (immediate=false): the prior zoomTo + panBy recipe computed the pan
   // from `cur` and `deltaPointsFromPixels` at the TRANSIENT mid-animation zoom, so the
-  // focal mis-scaled. fitBounds reaches the identical settled endpoint — scale
-  // = max(scaleCircle, scaleFit) (radius match + Rule A) and focal at the clamped
-  // region centre (Rule B) — by delegating the scale→zoom and centre conversion to
+  // focal mis-scaled. fitBounds reaches the requested settled endpoint — the scale
+  // chosen below and focal at the clamped region centre (keep-circle clamp) —
+  // by delegating the scale→zoom and centre conversion to
   // OSD's own coordinate transform, with no transient sample and no hand-rolled `k`.
   const vp   = v.viewport;
   const OSD  = window.OpenSeadragon;
@@ -355,11 +427,46 @@ function _applyFocalTarget(viewerCard, x, y, zoom, immediate) {
 
   // SCALE — radius match (Circle A→B) with the Rule A overview cap. `s` is element px
   // per image px; z_tgt/k reduces to exactly this, so no OSD-zoom calibration is needed.
-  const s_tgt = Math.min(region.w, region.h) / diameterImg;     // radius match (Circle A→B)
-  const s_cap = Math.min(rect.width / imgW, rect.height / imgH); // Rule A: whole-image fit
-  const s     = Math.max(s_tgt, s_cap);                          // applied scale (px / img px)
+  // Rule A's whole-image fit is measured against the UNCOVERED REGION, the frame every
+  // step is composed into, not the container: an image fit to the container is wider
+  // than the region by the width of the text card, so a quarter of it would sit under
+  // the card. At an overview (zoom ≤ 1, the full-object framing) that fit is also the
+  // ceiling — the whole object is what the step shows, so the image is never scaled
+  // past the size at which all of it fits the region.
+  // A region with no area — a card box that covers the viewport — leaves nothing to
+  // compose into, and both region-derived scales collapse to zero; the container fit
+  // keeps the viewer showing the image rather than a degenerate rectangle.
+  const hasRegion = region.w > 0 && region.h > 0;
+  const isOverview = zoom <= 1;
+  const s_tgt = Math.min(region.w, region.h) / diameterImg;         // radius match (Circle A→B)
+  const s_fit = hasRegion
+    ? Math.min(region.w / imgW, region.h / imgH)                    // Rule A: whole-image fit
+    : Math.min(rect.width / imgW, rect.height / imgH);
+  // At and below an overview the authored zoom is a fraction of the fit, so 1
+  // is the whole object filling the region and anything under it is the same
+  // object standing back from the frame with margin around it. 1 therefore
+  // means exactly what it has always meant, and the range below it — which
+  // used to give the same framing whatever was typed in it — reads as the
+  // pull-back an author writing 0.6 is asking for. The floor keeps the object
+  // recognisable rather than a speck, and keeps the rectangle handed to OSD
+  // away from degenerate.
+  //
+  // Bridge the different overview/detail scales across 1 < zoom < 2. Joining
+  // at 2 uses the widest band that preserves every zoom >= 2 detail. A straight
+  // segment is monotone, has no overshoot, and preserves the original endpoints
+  // exactly; slope continuity is not required. Since s_tgt is proportional to
+  // zoom, s_tgt * (2 / zoom) is the authored-circle scale at the join.
+  // If the circle fits at zoom 1 (s_fit <= s_tgt there), it fits throughout
+  // this band: the segment never exceeds the circle-match line. Otherwise a
+  // whole circle and the unchanged overview fit are geometrically incompatible
+  // near 1; the existing overview semantics take precedence.
+  const pull  = overviewPullFraction(zoom);
+  const s     = isOverview ? s_fit * pull
+    : zoom < 2
+      ? s_fit + (zoom - 1) * (Math.max(s_tgt * (2 / zoom), s_fit) - s_fit)
+      : Math.max(s_tgt, s_fit);  // applied scale (px / img px)
 
-  // FOCAL POSITION — uncovered-region centre, clamped to image bounds (Rule B). The
+  // FOCAL POSITION — uncovered-region centre, clamped by the keep-circle rule. The
   // edges are the focal→image-edge distances at the applied scale `s`; all element px.
   const CB    = { x: region.x + region.w / 2, y: region.y + region.h / 2 };
   const edges = {
@@ -368,7 +475,19 @@ function _applyFocalTarget(viewerCard, x, y, zoom, immediate) {
     eTop:    focalImg.y          * s,
     eBottom: (imgH - focalImg.y) * s,
   };
-  const F = _clampFocalPx(region, edges, CB);  // focal target position, element px
+  // The circle stands for the detail the author framed, and detail only exists
+  // where there is image. A focal near a corner carries a circle that reaches
+  // past the image's own edge — at x 0.05 on a 1200 px-wide image the radius is
+  // 106.6 image px against 60 to the edge — and the part that overhangs holds
+  // nothing. Reserving room for it put background on screen; requiring it on
+  // screen asked for the impossible. Capped at the largest circle centred on
+  // the focal that lies inside the image, which is scale-free: the overhang
+  // is a property of where the focal sits, not of how far in the viewer is.
+  const radiusPx = Math.min(
+    (diameterImg * s) / 2,
+    edges.eLeft, edges.eRight, edges.eTop, edges.eBottom,
+  );
+  const F = _clampFocalPx(region, edges, CB, radiusPx);  // focal target position, element px
 
   // TARGET RECT — the image-px rectangle that fills the viewer at scale `s`, placed so
   // focalImg lands at element px F. Its aspect equals the container's, so fitBounds maps
@@ -386,33 +505,6 @@ function _applyFocalTarget(viewerCard, x, y, zoom, immediate) {
 }
 
 // ── Plate activation and deactivation ────────────────────────────────────────
-
-/**
- * Deactivate a viewer plate.
- *
- * Direction determines the visual transition:
- *
- *   Forward — the plate stays at translateY(0). It is not visible because
- *   the incoming plate has a higher z-index and covers it. We only remove
- *   the is-active class so CSS knows the plate is no longer current.
- *
- *   Backward — the plate slides back down via translateY(100%), reversing
- *   the slide-up animation that brought it into view. The plate below it
- *   (which was already at translateY(0)) becomes visible again.
- *
- * @param {ViewerCard} viewerCard - The card to deactivate.
- * @param {'forward'|'backward'} direction - Navigation direction.
- */
-export function deactivateIiifCard(viewerCard, direction) {
-  if (!viewerCard || !viewerCard.element) return;
-
-  viewerCard.element.classList.remove('is-active');
-
-  if (direction === 'backward') {
-    viewerCard.element.style.transform = 'translateY(100%)';
-  }
-  // Forward: plate stays at translateY(0) — covered by newer higher-z plate
-}
 
 // ── Plate destruction ────────────────────────────────────────────────────────
 
@@ -454,7 +546,7 @@ export function destroyIiifCard(viewerCard) {
  * Applies the two-circle target via _applyFocalTarget: the focal circle is
  * inscribed in the uncovered region (scale = max(scaleCircle, scaleFit)) and placed
  * at the clamped region centre by fitting the corresponding image-px rectangle with
- * vp.fitBounds. Rule A and Rule B are enforced inside _applyFocalTarget.
+ * vp.fitBounds. Rule A and the keep-circle clamp are enforced inside _applyFocalTarget.
  *
  * @param {ViewerCard} viewerCard - The card to position.
  * @param {number} x - Normalised horizontal position (0–1).
@@ -470,13 +562,57 @@ export function snapIiifToPosition(viewerCard, x, y, zoom) {
   _applyFocalTarget(viewerCard, x, y, zoom, true);
 }
 
+// Seconds the viewer takes to pan and zoom, and the spring's approach to it.
+// This spring drives the viewer only where the per-frame interpolation does
+// not: across an object change, which is the one move the interpolation bails
+// out of. Everywhere else the scroll paces the viewer and this is written
+// over each frame. It matches the pace of a move for that reason — a scene
+// change is a move like any other, and a reader should not be able to tell
+// which of the two carried the image.
+// Restoring OSD's own values has to outlast the spring, so the restore is
+// derived from the duration in force rather than stated as a second number
+// that has to be kept in step with it by hand.
+const PAN_ZOOM_SECONDS = 1.2;
+const PAN_ZOOM_STIFFNESS = 0.8;
+
 /**
- * Animate a viewer plate to a position over 4 seconds.
+ * Read a tuning override for the pan and zoom from the query string.
+ *
+ * `?panzoom=6` gives a six-second travel, `?panzoom=6,0.5` a six-second
+ * travel on a gentler spring. A value outside the range leaves the default,
+ * so a mistyped switch cannot stall the viewer for a minute or snap it in a
+ * frame. Resolved once, and only for as long as the duration is being
+ * settled — it goes when the number does, the same standing as the
+ * card-height switch.
+ *
+ * @returns {{ seconds: number, stiffness: number }}
+ */
+let _panZoomTuning = null;
+function _panZoomSettings() {
+  if (_panZoomTuning) return _panZoomTuning;
+
+  _panZoomTuning = { seconds: PAN_ZOOM_SECONDS, stiffness: PAN_ZOOM_STIFFNESS };
+  try {
+    const raw = new URLSearchParams(window.location.search).get('panzoom');
+    if (raw) {
+      const [s, k] = raw.split(',').map(Number);
+      if (s >= 0.2 && s <= 20) _panZoomTuning.seconds = s;
+      if (k > 0 && k <= 10) _panZoomTuning.stiffness = k;
+    }
+  } catch {
+    // A URL we cannot read leaves the defaults standing.
+  }
+  return _panZoomTuning;
+}
+
+/**
+ * Animate a viewer plate to a position.
  *
  * Used when the user navigates via keyboard or button to a step with the
  * same object — the viewer pans and zooms smoothly to the new coordinates
  * using OSD's built-in spring animation. Animation time and spring stiffness
- * are temporarily increased from their defaults, then restored after 4.1 s.
+ * are temporarily raised from OSD's defaults and restored once the spring
+ * has settled.
  *
  * Click-to-zoom is disabled during the animation to prevent accidental zooms.
  *
@@ -495,6 +631,7 @@ export function animateIiifToPosition(viewerCard, x, y, zoom) {
   }
 
   const osdViewer = viewerCard.osdViewer;
+  const { seconds, stiffness } = _panZoomSettings();
 
   // Reduced-motion users: bypass OSD spring animation; snap immediately.
   const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -505,8 +642,8 @@ export function animateIiifToPosition(viewerCard, x, y, zoom) {
   const originalAnimationTime    = osdViewer.animationTime;
   const originalSpringStiffness  = osdViewer.springStiffness;
 
-  osdViewer.animationTime   = 4.0;
-  osdViewer.springStiffness = 0.8;
+  osdViewer.animationTime   = seconds;
+  osdViewer.springStiffness = stiffness;
 
   // Apply the recipe: immediate=true for reduced-motion, false for spring animation
   _applyFocalTarget(viewerCard, x, y, zoom, prefersReduced);
@@ -514,10 +651,34 @@ export function animateIiifToPosition(viewerCard, x, y, zoom) {
   setTimeout(() => {
     osdViewer.animationTime   = originalAnimationTime;
     osdViewer.springStiffness = originalSpringStiffness;
-  }, 4100);
+  }, seconds * 1000 + 100);
 }
 
 // ── Per-frame IIIF interpolation ─────────────────────────────────────────────
+
+/** The object a step shows, under either of the names step data carries it by. */
+function _objectOf(step) {
+  return step.object || step.objectId || '';
+}
+
+/**
+ * A step's x, y and zoom as numbers, or null when any of them is not one.
+ *
+ * Not `stepFraming`, which falls back to the whole object per axis: a pair of
+ * steps with a cell that is not a number is not interpolated at all, and the
+ * viewer keeps the framing the step's own activation gave it.
+ */
+function _authoredFraming(step) {
+  const x = parseFloat(step.x), y = parseFloat(step.y), zoom = parseFloat(step.zoom);
+  if (isNaN(x) || isNaN(y) || isNaN(zoom)) return null;
+  return { x, y, zoom };
+}
+
+/** Whether a viewer already rests at this framing for this step. */
+function _restsAt(settled, stepIndex, x, y, zoom) {
+  return Boolean(settled) && settled.step === stepIndex &&
+    settled.x === x && settled.y === y && settled.zoom === zoom;
+}
 
 /**
  * Interpolate IIIF viewer position between two steps based on scroll progress.
@@ -540,31 +701,46 @@ export function animateIiifToPosition(viewerCard, x, y, zoom) {
  *   same index space as stepIndex / state.stepToScene (i.e. state.stepsData).
  */
 export function lerpIiifPosition(stepIndex, progress, stepsData) {
-  if (progress < 0.001) return; // At exact integer, no interpolation needed
-
   const stepA = stepsData[stepIndex];
   const stepB = stepsData[stepIndex + 1];
   if (!stepA || !stepB) return;
 
-  const objectIdA = stepA.object || stepA.objectId || '';
-  const objectIdB = stepB.object || stepB.objectId || '';
-  if (objectIdA !== objectIdB) return; // different object, freeze
+  if (_objectOf(stepA) !== _objectOf(stepB)) return; // different object, freeze
 
-  const xA = parseFloat(stepA.x), yA = parseFloat(stepA.y), zA = parseFloat(stepA.zoom);
-  const xB = parseFloat(stepB.x), yB = parseFloat(stepB.y), zB = parseFloat(stepB.zoom);
+  const a = _authoredFraming(stepA);
+  const b = _authoredFraming(stepB);
+  if (!a || !b) return;
 
-  if (isNaN(xA) || isNaN(yA) || isNaN(zA)) return;
-  if (isNaN(xB) || isNaN(yB) || isNaN(zB)) return;
+  // A whole step is a resting place, and the framing there is the author's
+  // own, stated rather than approached. The interpolation stops a fraction of
+  // a step short — the scroll settles and the last frame written is the one
+  // before the boundary — so a step reached this way would otherwise keep the
+  // framing of a position just outside it. The scale is continuous across the
+  // overview boundary now, so this no longer rescues a step from the wrong side
+  // of a cliff; it still states the authored endpoint exactly, which is what a
+  // reader resting on a step is owed.
+  const atRest = progress < 0.001;
+  const between = (from, to) => (atRest ? from : from + (to - from) * progress);
+  const x    = between(a.x, b.x);
+  const y    = between(a.y, b.y);
+  const zoom = between(a.zoom, b.zoom);
 
-  const x    = xA + (xB - xA) * progress;
-  const y    = yA + (yB - yA) * progress;
-  const zoom = zA + (zB - zA) * progress;
-
-  // Find the active viewer card for this scene (not by objectId — repeated objects have
-  // multiple scenes and objectId lookup would find the wrong one on backward nav).
-  const sceneIndex = state.stepToScene[stepIndex];
-  const viewerCard = state.viewerCards.find(vc => vc.sceneIndex === sceneIndex);
+  // Keyed by scene, not by objectId: an object appearing in several scenes has
+  // a plate for each, and an objectId lookup finds the wrong one on backward
+  // navigation. `isReady` is the image plate's own flag, so a plate holding a
+  // player answers undefined and is passed over.
+  const viewerCard = state.viewerPlates[state.stepToScene[stepIndex]];
   if (!viewerCard || !viewerCard.isReady) return;
+
+  // At rest the same framing is true on every frame, and a snap is a forced
+  // layout in OSD, so the resting write happens once per arrival rather than
+  // for as long as the reader stays on the step.
+  if (atRest) {
+    if (_restsAt(viewerCard.settledAt, stepIndex, x, y, zoom)) return;
+    viewerCard.settledAt = { step: stepIndex, x, y, zoom };
+  } else {
+    viewerCard.settledAt = null;
+  }
 
   snapIiifToPosition(viewerCard, x, y, zoom);
 }
@@ -580,14 +756,16 @@ export function lerpIiifPosition(stepIndex, progress, stepsData) {
  * compensation runs again with the current (post-resize) cardOverlayRect
  * and viewport dimensions.
  *
- * Called by the onViewportResize and onLayoutChange subscribers below.
+ * Called by the onViewportResize and onLayoutChange subscribers below, and by
+ * card-pool.js when the active card's overlay rect is measured for the first
+ * time (until then the focal target works from the CSS-derived default box).
  */
-function _reSnapActiveViewer() {
-  // Find the active viewer card by its plate element's is-active class.
-  // (Do not use state.currentObjectRun.objectId — it is not unique when the
-  // same object appears in multiple scenes; use the element flag instead.)
-  const viewerCard = state.viewerCards.find(
-    vc => vc.element && vc.element.classList.contains('is-active')
+export function reSnapActiveViewer() {
+  // Found by the plate element's is-active class, not by
+  // state.currentObjectRun.objectId, which is not unique when the same object
+  // appears in several scenes.
+  const viewerCard = Object.values(state.viewerPlates).find(
+    plate => plate.container?.classList.contains('is-active')
   );
   if (!viewerCard || !viewerCard.isReady) return;
 
@@ -603,11 +781,8 @@ function _reSnapActiveViewer() {
   const step = steps[stepIndex];
   if (!step) return;
 
-  const x    = parseFloat(step.x);
-  const y    = parseFloat(step.y);
-  const zoom = parseFloat(step.zoom);
-  if (isNaN(x) || isNaN(y) || isNaN(zoom)) return;
-
+  // A cell left blank falls back as it does on activation: to the whole object.
+  const { x, y, zoom } = stepFraming(step);
   snapIiifToPosition(viewerCard, x, y, zoom);
 }
 
@@ -618,7 +793,7 @@ function _reSnapActiveViewer() {
 // viewport dimensions and (if card-pool has already recomputed) the updated
 // state.cardOverlayRect.
 onViewportResize(() => {
-  _reSnapActiveViewer();
+  reSnapActiveViewer();
 });
 
 // onLayoutChange: fires on horizontal↔vertical mode flip, BEFORE onViewportResize.
@@ -630,6 +805,6 @@ onLayoutChange(() => {
     // Re-read the active card rect after the CSS reflow has settled.
     const activeCard = document.querySelector('.text-card.is-active');
     state.cardOverlayRect = activeCard ? activeCard.getBoundingClientRect() : null;
-    _reSnapActiveViewer();
+    reSnapActiveViewer();
   });
 });

@@ -29,12 +29,22 @@ from one story CSV and performs several passes over the data:
    heading and is left alone), so `[[term]]` works in the main story text,
    not only in layer panels.
 
-3. **Coordinate defaults** — empty `x`, `y`, and `zoom` cells get default
-   values (0.5, 0.5, 1) so the viewer always has a valid starting
-   position.
+3. **Answer limits** — the step's `answer` is prose read on a card that
+   does not scroll, so it is held to plain prose and to a length that
+   fits. `ANSWER_PROSE_RULES` says what comes out of it and what is
+   flattened, and an answer still above `ANSWER_WORD_LIMIT` words is cut
+   at a word boundary that does not land inside markup. A softer limit
+   read from `_config.yml` only warns. This pass runs on the answer as
+   the author wrote it, before glossary anchors go into it.
 
-4. **Warning aggregation** — all warnings (missing objects, missing
-   markdown files, broken glossary links, widget errors) are collected
+4. **Coordinates** — empty `x`, `y`, and `zoom` cells get default
+   values (0.5, 0.5, 1) so the viewer always has a valid starting
+   position. A comma decimal (`0,5`) is read as the number it is. Any
+   other cell that is not a number is reported and left as typed.
+
+5. **Warning aggregation** — all warnings (missing objects, missing
+   markdown files, broken glossary links, widget errors, answers held to
+   the limits, coordinates that are not numbers) are collected
    into a `viewer_warnings` list stored in `df.attrs`, which the core
    module later injects into the JSON output for display in the story's
    intro panel.
@@ -43,11 +53,14 @@ In Christmas Tree Mode, `process_story()` appends additional fake
 warnings covering every warning type (viewer, panel, glossary) so that
 the intro panel's error display can be visually tested.
 
-Version: v1.7.0
+Version: v1.8.0
 """
 
+import html
+import math
 import re
 import json
+from collections import namedtuple
 from pathlib import Path
 
 import pandas as pd
@@ -56,7 +69,7 @@ from telar.config import get_lang_string
 from telar.glossary import load_glossary_terms, process_glossary_links
 from telar.markdown import read_markdown_file, process_inline_content
 from telar.csv_utils import IMAGE_EXTENSIONS, build_stem_index
-from telar.latex import has_latex
+from telar.latex import has_latex, latex_spans
 from telar.media_type import AUDIO_EXTENSIONS
 
 
@@ -65,6 +78,278 @@ def _warn(msg, warnings):
     print(f"  [WARN] {msg}")
     warnings.append(msg)
 
+
+
+ANSWER_WORD_LIMIT = 200
+"""Words a step's answer may hold before the build cuts it.
+
+Above this the answer is unreadable rather than merely long: on the desktop
+layout the side card never scrolls, so everything past the card's edge is
+clipped and no reader can reach it. The tightest common laptop cells hold
+225 words at 1280x720, 264 at 1366x768 and 275 at 1440x757, and this limit
+sits under that floor with a margin for a larger type size.
+
+The Compositor reads this constant by name, from this module, for a parity
+test against its own editor-side limit, so the name and the module path are
+part of that shared contract and cannot move quietly.
+"""
+
+ANSWER_MEDIA = 'media'
+ANSWER_FOOTNOTES = 'footnotes'
+ANSWER_MARKUP = 'markup'
+
+_ProseRule = namedtuple('_ProseRule', 'name kind pattern replacement')
+
+ANSWER_PROSE_RULES = (
+    _ProseRule(
+        'fenced code block', ANSWER_MARKUP,
+        re.compile(r'^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*\n?',
+                   re.MULTILINE),
+        ''),
+    _ProseRule(
+        'table', ANSWER_MARKUP,
+        re.compile(r'^[^\n|]*\|[^\n]*\n'
+                   r'[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*'
+                   r'(?:\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*\n'
+                   r'(?:[^\n]*\|[^\n]*\n?)*',
+                   re.MULTILINE),
+        ''),
+    _ProseRule(
+        'image or embed', ANSWER_MEDIA,
+        re.compile(r'!\[[^\]]*\]\([^)]*\)'
+                   r'|<(img|iframe|video|audio|embed|object)\b[^>]*>'
+                   r'(?:.*?</\1\s*>)?',
+                   re.IGNORECASE | re.DOTALL),
+        ''),
+    _ProseRule(
+        'footnote definition', ANSWER_FOOTNOTES,
+        re.compile(r'^[ \t]*\[\^[^\]]*\]:.*(?:\n[ \t]+\S.*)*\n?',
+                   re.MULTILINE),
+        ''),
+    _ProseRule(
+        'footnote reference', ANSWER_FOOTNOTES,
+        re.compile(r'\[\^[^\]]*\]'),
+        ''),
+    _ProseRule(
+        'horizontal rule', ANSWER_MARKUP,
+        re.compile(r'^[ \t]{0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}'
+                   r'|(?:_[ \t]*){3,})$\n?',
+                   re.MULTILINE),
+        ''),
+    _ProseRule(
+        'blockquote mark', ANSWER_MARKUP,
+        re.compile(r'^[ \t]*(?:>[ \t]?)+', re.MULTILINE),
+        ''),
+    _ProseRule(
+        'heading mark', ANSWER_MARKUP,
+        re.compile(r'^[ \t]*#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$', re.MULTILINE),
+        r'\1'),
+    _ProseRule(
+        'list marker', ANSWER_MARKUP,
+        re.compile(r'^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+', re.MULTILINE),
+        ''),
+)
+"""Everything a step's answer is not allowed to be, in the order applied.
+
+A step's answer is plain prose. The Compositor mirrors this set on the
+editor side and reads this list as the contract, so both the expressions
+and their order are part of it.
+
+Removed outright, with the words inside them:
+
+  - **fenced code block** -- ``` or ~~~ through its matching fence.
+  - **table** -- a pipe-table block: a row carrying a pipe, a delimiter
+    row, and the body rows that follow while they carry one.
+  - **image or embed** -- markdown image syntax, and the HTML elements
+    that bring their own media (img, iframe, video, audio, embed,
+    object), opening tag through closing tag where one exists.
+  - **footnote definition** -- a line opening `[^n]:`, through the
+    indented continuation lines that belong to it.
+  - **footnote reference** -- `[^n]` in the prose. It runs after the
+    definition rule, which would otherwise be left holding a bare colon.
+  - **horizontal rule** -- a line of three or more dashes, asterisks or
+    underscores. It runs before the list rule, which would read `* * *`
+    as a bullet.
+
+Flattened, losing their marks and keeping their words:
+
+  - **blockquote mark** -- the leading `>`, every level of it. It runs
+    before the heading and list rules, so a quoted heading or bullet
+    reaches them.
+  - **heading mark** -- the ATX `#` marks, leading and closing.
+  - **list marker** -- the bullet or number opening a list item.
+
+Untouched, because they are prose: bold, italics, inline links,
+`[[term]]`, inline LaTeX, code spans, paragraph breaks.
+
+Detection runs on the raw markdown with no awareness of code spans, so
+image syntax inside backticks goes too. The rules have to be expressions
+the Compositor can implement identically, and a step's answer is prose
+about an object rather than a markdown tutorial. A bare image URL is
+text and stays.
+
+Nothing repairs the whitespace a removal leaves behind: each rule takes
+out what it matched and nothing else, so an answer carrying none of these
+comes back byte for byte and markdown decides what the rest means.
+"""
+
+# The order warnings are reported in, one per answer per kind, whatever
+# order the rules that fired sit in.
+ANSWER_KINDS = (ANSWER_MEDIA, ANSWER_FOOTNOTES, ANSWER_MARKUP)
+
+# What each kind is called in the message catalogue.
+_ANSWER_KIND_KEYS = {
+    ANSWER_MEDIA: 'answer_image_dropped',
+    ANSWER_FOOTNOTES: 'answer_footnotes_dropped',
+    ANSWER_MARKUP: 'answer_markup_flattened',
+}
+
+# Markup a cut must not land inside. Each of these is one thing to a reader
+# and to the renderer, so half of one publishes as broken syntax rather than
+# as a shortened answer. LaTeX comes from telar.latex, which owns the
+# question of what maths looks like. A footnote reference is absent because
+# the prose rules have already taken it out.
+_ANSWER_ATOMIC = [
+    re.compile(r'\[\[[^\]]*\]\]'),        # glossary reference
+    re.compile(r'\[[^\]]*\]\([^)]*\)'),   # markdown link
+    re.compile(r'`[^`]*`'),               # code span
+    re.compile(r'<[^>]+>'),               # inline HTML tag
+]
+
+# The token that ends a cut answer. One character, so the count of words
+# before it stays the count this module reports.
+_ANSWER_ELLIPSIS = '…'
+
+
+def _count_answer_words(text):
+    """The number of words in *text*, by the rule the Compositor shares.
+
+    Trim, split on Unicode whitespace, count the non-empty tokens. Markup
+    and URLs are words, because they take up the card like any other text,
+    and a non-breaking space separates words like any other whitespace.
+    """
+    return len(str(text).split())
+
+
+def _reduce_answer_to_prose(text):
+    """*text* as plain prose, and the kinds of thing that came out of it.
+
+    Applies ANSWER_PROSE_RULES in order; that constant's docstring is the
+    whole of what the rules are and why they run in that order. The kinds
+    come back in ANSWER_KINDS order rather than in the order the rules
+    fired, so one answer earns one warning per kind and always the same
+    sequence of them.
+    """
+    fired = set()
+    for rule in ANSWER_PROSE_RULES:
+        text, count = rule.pattern.subn(rule.replacement, text)
+        if count:
+            fired.add(rule.kind)
+
+    return text, [kind for kind in ANSWER_KINDS if kind in fired]
+
+
+def _answer_atomic_spans(text):
+    """Every span in *text* a cut must fall outside of."""
+    spans = [(match.start(), match.end())
+             for pattern in _ANSWER_ATOMIC
+             for match in pattern.finditer(text)]
+    spans.extend(latex_spans(text))
+    return spans
+
+
+def _cut_answer(text, limit):
+    """*text* shortened to at most *limit* words, closed with an ellipsis.
+
+    The cut lands on a word boundary, and never inside markup. A boundary
+    that falls within a link, a glossary or footnote reference, a code
+    span, a LaTeX span or an HTML tag moves back to the start of that
+    markup and then back to the nearest earlier boundary, repeating until
+    it is clear -- so an answer that ends near markup publishes shorter
+    than the limit rather than broken at it.
+
+    A token holding no whitespace cannot be split this way, because a word
+    boundary never falls inside one.
+    """
+    boundaries = [match.end() for match in re.finditer(r'\S+', text)]
+    if len(boundaries) <= limit:
+        return text
+
+    spans = _answer_atomic_spans(text)
+    cut = boundaries[limit - 1]
+    while True:
+        straddled = [start for start, end in spans if start < cut < end]
+        if not straddled:
+            break
+        cut = min(straddled)
+        earlier = [end for end in boundaries if end <= cut]
+        cut = earlier[-1] if earlier else 0
+
+    return text[:cut] + _ANSWER_ELLIPSIS
+
+
+def _limit_answers(df, story_name, warnings, answer_warnings):
+    """Hold every step's answer to text only, and to a readable length.
+
+    Runs on the answer exactly as the author typed it, ahead of the
+    glossary pass, so the word count is the author's own words and the
+    markup the cut protects is the markup they wrote rather than the
+    anchors Telar injects.
+
+    An answer over ANSWER_WORD_LIMIT is cut and reported. Length on its
+    own earns no report: the build speaks where it has changed the
+    author's words and stays quiet where it has not.
+
+    The prose rules run first, so the count is of the words that survive
+    them: a list of two hundred bulleted words is two hundred words, and a
+    footnote the rules removed weighs nothing.
+    """
+    if 'answer' not in df.columns:
+        return df
+
+    story = story_name or 'unknown'
+
+    for idx, row in df.iterrows():
+        raw = str(row['answer'])
+        if not raw.strip():
+            continue
+
+        step = row.get('step', 'unknown')
+        label = _step_label(step)
+        answer = raw
+
+        answer, kinds = _reduce_answer_to_prose(answer)
+        for kind in kinds:
+            _report_answer(
+                _ANSWER_KIND_KEYS[kind], step, answer_warnings, warnings,
+                story=story, step_label=label)
+
+        count = _count_answer_words(answer)
+        if count > ANSWER_WORD_LIMIT:
+            answer = _cut_answer(answer, ANSWER_WORD_LIMIT)
+            _report_answer(
+                'answer_over_hard_limit', step, answer_warnings, warnings,
+                story=story, step_label=label, count=count,
+                limit=ANSWER_WORD_LIMIT)
+
+        if answer != raw:
+            df.at[idx, 'answer'] = answer
+
+    return df
+
+
+def _report_answer(key, step, answer_warnings, warnings, step_label, **fields):
+    """One localised report, to the build log and to the intro panel.
+
+    The message is a whole sentence naming its own story and step, because
+    the build log prints it with no context around it. It travels as a
+    `panel` warning, the type the intro panel renders unprefixed.
+    """
+    message = get_lang_string('errors.object_warnings.' + key,
+                              step=step_label, **fields)
+    _warn(message, warnings)
+    answer_warnings.append({'step': step, 'type': 'panel',
+                            'message': message})
 
 
 def _normalise_frame(df):
@@ -87,28 +372,71 @@ def _normalise_frame(df):
     return df
 
 
+def _step_label(step):
+    """The step as its author wrote it, not as pandas typed it.
+
+    A page column with a blank in it makes pandas read the whole sheet's
+    step numbers as floats, so a warning about step 1 said "step 1.0".
+    Only the label is normalised; the offending value is quoted exactly as
+    it was read, because that is the author's own data.
+    """
+    if isinstance(step, float) and step.is_integer():
+        return str(int(step))
+    return str(step)
+
+
+def _page_value(raw, step, warnings):
+    """One cell as a page number, or '' with a warning.
+
+    float() runs first because a spreadsheet writes a whole number as
+    3.0. OverflowError joins the caught set because it is what
+    int(float('Infinity')) raises, and it is a sibling of ValueError
+    rather than a subclass -- omitting it crashed the build on a cell a
+    person can type by hand.
+    """
+    if not pd.notna(raw) or not str(raw).strip():
+        return ''
+
+    try:
+        page = int(float(str(raw).strip()))
+        if page < 1:
+            raise ValueError
+    except (ValueError, TypeError, OverflowError):
+        _warn(f"Story step {_step_label(step)}: invalid page value "
+              f"'{raw}' (must be positive integer)", warnings)
+        return ''
+
+    return page
+
+
 def _validate_page_column(df, warnings):
     """A page number is an integer or it is nothing.
 
     A step that names a page the story does not have would render
     nowhere, so an unusable value is cleared and said out loud rather
     than carried into the JSON.
+
+    The column is rebuilt rather than written cell by cell, and that is
+    the whole of why this function looks like this. pandas gives a column
+    a dtype from what it read, and refuses a value of another type into
+    it:
+
+      - a column pandas read as text (one typo beside real page numbers)
+        rejected the integer, so every *valid* page in that column was
+        cleared and reported as invalid;
+      - a column pandas read as numbers (a 0 from someone counting from
+        zero, beside a blank) rejected the empty string used to clear it,
+        and the TypeError escaped this function and stopped the build.
+
+    Assigning the whole column at once replaces its dtype instead of
+    fighting it, so neither case arises.
     """
-    # Validate and normalize page column
-    if 'page' in df.columns:
-        for idx, row in df.iterrows():
-            page_val = row.get('page', '')
-            step_num = row.get('step', 'unknown')
-            if pd.notna(page_val) and str(page_val).strip():
-                try:
-                    page_int = int(float(str(page_val).strip()))
-                    if page_int < 1:
-                        raise ValueError
-                    df.at[idx, 'page'] = page_int
-                except (ValueError, TypeError):
-                    msg = f"Story step {step_num}: invalid page value '{page_val}' (must be positive integer)"
-                    _warn(msg, warnings)
-                    df.at[idx, 'page'] = ''
+    if 'page' not in df.columns:
+        return df
+
+    df['page'] = [_page_value(row.get('page', ''), row.get('step', 'unknown'),
+                              warnings)
+                  for _, row in df.iterrows()]
     return df
 
 
@@ -128,8 +456,13 @@ def _load_objects_data():
     try:
         with open(objects_json_path, 'r', encoding='utf-8') as f:
             objects_list = json.load(f)
-            # Create lookup dictionary by object_id
-            return {obj['object_id']: obj for obj in objects_list}
+            # Keyed by id, and only by records that have one. The objects
+            # build drops a blank id before it writes this file, so its own
+            # output never carries a null here; the guard is because this
+            # reads a file from disk rather than a frame it produced, and the
+            # matcher lowercases every key, which a null does not survive.
+            return {obj['object_id']: obj for obj in objects_list
+                    if isinstance(obj.get('object_id'), str) and obj['object_id']}
     except Exception as e:
         print(f"  [WARN] Could not load objects.json for validation: {e}")
         return None
@@ -358,6 +691,47 @@ def _apply_coordinate_defaults(df):
     return df
 
 
+# A decimal typed with a comma, the way a Spanish-speaking author writes one:
+# `0,5` or `-1,25`. One comma between digits, nothing else.
+_COMMA_DECIMAL = re.compile(r'^\s*(-?\d+),(\d+)\s*$')
+
+
+def _check_coordinates(df, story_name, warnings, coordinate_warnings):
+    """Read a comma decimal as a number, and report a cell that is neither.
+
+    Runs after the defaults, so every blank already holds one and what is
+    left is what the author typed. A comma decimal says a number plainly,
+    so it is rewritten with a point and nothing is reported. Anything else
+    that does not read as a finite number is reported and left as typed:
+    rewriting it would make the page look right while the sheet stayed
+    wrong, and the viewer's own fallback keeps the step usable meanwhile.
+    """
+    story = story_name or 'unknown'
+    for col in ('x', 'y', 'zoom'):
+        if col not in df.columns:
+            continue
+        for idx, raw in df[col].items():
+            value = str(raw)
+            comma = _COMMA_DECIMAL.match(value)
+            if comma:
+                df.at[idx, col] = f'{comma.group(1)}.{comma.group(2)}'
+                continue
+            try:
+                if math.isfinite(float(value)):
+                    continue
+            except ValueError:
+                pass
+            step = df.at[idx, 'step'] if 'step' in df.columns else 'unknown'
+            message = get_lang_string(
+                'errors.object_warnings.coordinate_not_a_number',
+                column=col, step=_step_label(step), story=story,
+                value=html.escape(value.strip()).replace('`', "'"))
+            _warn(message, warnings)
+            coordinate_warnings.append({'step': step, 'type': 'panel',
+                                        'message': message})
+    return df
+
+
 def _collect_step_warnings(df):
     """Everything the intro panel will show, gathered from the columns.
 
@@ -437,12 +811,16 @@ def _add_christmas_tree_warnings(df, all_warnings):
     Appended rather than substituted: the point is to see them beside
     whatever the story really produced.
     """
-    # Inject test warnings for various error types
+    # Every message here is one the build really emits, because the point of
+    # this mode is to look at the warnings as an author would see them. A
+    # message written only for the demonstration shows something no story can
+    # produce, and is a string nothing else keeps honest.
     fake_warnings = [
         {
             'step': 1,
             'type': 'viewer',
-            'message': get_lang_string('errors.object_warnings.missing_object_id')
+            'message': get_lang_string('errors.object_warnings.object_not_found',
+                                       object_id='an-object-not-in-objects-csv')
         },
         {
             'step': 2,
@@ -460,7 +838,7 @@ def _add_christmas_tree_warnings(df, all_warnings):
     df.attrs['viewer_warnings'] = all_warnings + fake_warnings
     print("\U0001f384 Christmas Tree Mode: Injected test warnings into story")
 
-def process_story(df, christmas_tree=False):
+def process_story(df, christmas_tree=False, story_name=''):
     """
     Process story CSV with panel content (file references or inline text).
 
@@ -471,6 +849,10 @@ def process_story(df, christmas_tree=False):
     Args:
         df: pandas DataFrame from story CSV
         christmas_tree: If True, inject fake warnings for testing
+        story_name: The story's name, for warnings that have to say which
+            story they are about. A DataFrame carries no such name, so the
+            caller supplies it; a caller that has none gets warnings that
+            say 'unknown', which is the step column's own fallback.
 
     Returns:
         pandas DataFrame with processed content and aggregated warnings
@@ -483,18 +865,24 @@ def process_story(df, christmas_tree=False):
     glossary_terms = load_glossary_terms()
     glossary_warnings = []
     widget_warnings = []
+    answer_warnings = []
 
     df = _normalise_frame(df)
+    df = _limit_answers(df, story_name, warnings, answer_warnings)
     df = _validate_page_column(df, warnings)
     df = _validate_object_references(df, _load_objects_data(), warnings)
     df = _process_content_columns(df, glossary_terms, glossary_warnings,
                                   widget_warnings)
     df = _resolve_answer_glossary(df, glossary_terms, glossary_warnings)
     df = _apply_coordinate_defaults(df)
+    coordinate_warnings = []
+    df = _check_coordinates(df, story_name, warnings, coordinate_warnings)
 
     all_warnings = _collect_step_warnings(df)
+    all_warnings.extend(coordinate_warnings)
     all_warnings.extend(glossary_warnings)
     all_warnings.extend(widget_warnings)
+    all_warnings.extend(answer_warnings)
     df.attrs['viewer_warnings'] = all_warnings
 
     df.attrs['has_latex'] = _detect_latex(df)

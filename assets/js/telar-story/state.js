@@ -30,6 +30,51 @@
 /** Minimum time (ms) between mobile/embed button taps. */
 export const MOBILE_NAV_COOLDOWN = 400;
 
+// Seconds a programmatic move to a step takes. This one number is the pace of
+// the whole move: Lenis carries the scroll over it, the per-frame interpolation
+// follows the scroll and so the viewer pans and zooms over it too, and the card
+// slide is written to match. The keyboard is given longer than a button because
+// a reader holding an arrow key is reading as they go, where a reader who has
+// clicked a section has already chosen where to be.
+//
+// It lives here rather than beside the scroll because two modules that cannot
+// import one another both need it: scroll-engine.js paces the move by it, and
+// card-height.js hands it to the stylesheet as the clock the cards and plates
+// move on.
+const NAV_SECONDS = { keyboard: 1.2, button: 0.75 };
+
+/**
+ * Read a tuning override for the pace of a programmatic move.
+ *
+ * `?nav=1.6` gives the keyboard that many seconds and scales the button move
+ * by the same factor, so the two keep their relation. `?nav=1.6,0.9` sets them
+ * independently. A value outside the range leaves the defaults, so a mistyped
+ * switch cannot strand the reader mid-move. Resolved once, and only for as
+ * long as the pace is being settled.
+ *
+ * @returns {{ keyboard: number, button: number }}
+ */
+let _navTuning = null;
+export function navSeconds() {
+  if (_navTuning) return _navTuning;
+
+  _navTuning = { ...NAV_SECONDS };
+  try {
+    const raw = new URLSearchParams(window.location.search).get('nav');
+    if (raw) {
+      const [k, btn] = raw.split(',').map(Number);
+      if (k >= 0.1 && k <= 20) {
+        _navTuning.keyboard = k;
+        _navTuning.button = NAV_SECONDS.button * (k / NAV_SECONDS.keyboard);
+      }
+      if (btn >= 0.1 && btn <= 20) _navTuning.button = btn;
+    }
+  } catch {
+    // A URL we cannot read leaves the defaults standing.
+  }
+  return _navTuning;
+}
+
 // ── Mutable state ────────────────────────────────────────────────────────────
 
 /**
@@ -58,11 +103,6 @@ export const state = {
   /** Snap plugin instance reference. */
   snap: null,
 
-  // ── Viewer cards ─────────────────────────────────────────────────────────
-  /** @type {ViewerCard[]} Pool of viewer card objects. */
-  viewerCards: [],
-  /** Counter for generating unique viewer instance DOM IDs. */
-  viewerCardCounter: 0,
   /** Quick lookup: object_id → object data from window.objectsData. */
   objectsIndex: {},
 
@@ -102,14 +142,12 @@ export const state = {
   /** @type {number[]} Measured manifest fetch times (ms) for threshold tuning. */
   manifestLoadTimes: [],
 
-  // ── Card registry ──────────────────────────────────────────────────────────
   /**
-   * @type {Object[]} Permanent step→card record: one entry per story step,
-   * built once at initCardPool time and never evicted. Not a pool — the
-   * capped, evicting structure is `viewerCards` above.
+   * Map of sceneIndex -> Plate, one per scene, built once and never evicted.
+   * `.container` is the element. What a plate holds — a viewer, a player,
+   * nothing yet — is the plate's own business; the pool inside an image
+   * plate is the only thing here that is capped.
    */
-  cardRegistry: [],
-  /** Map of sceneIndex -> viewer plate element (one plate per scene). */
   viewerPlates: {},
   /** Map of stepIndex -> text card element. */
   textCards: {},

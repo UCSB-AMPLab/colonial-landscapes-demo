@@ -41,17 +41,20 @@ build workflow that actually runs it — and refuses to run when they are
 missing, so a site can never publish protected content because its workflow
 predates the build-time encryption step.
 
-Version: v1.6.0
+Version: v1.8.0
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
-from telar.csv_utils import sanitize_dataframe, normalize_column_names, is_header_row
+from telar.csv_utils import (sanitize_dataframe, normalize_column_names,
+                             is_header_row, text_column_dtypes, OBJECT_FIELDS,
+                             ColumnCollisionError, ReservedColumnError)
 from telar.processors.project import process_project_setup
 from telar.processors.objects import process_objects
 from telar.processors.stories import process_story
@@ -61,7 +64,8 @@ from telar.media_type import AUDIO_EXTENSIONS
 from telar.search import generate_search_data
 
 
-def csv_to_json(csv_path, json_path, process_func=None):
+def csv_to_json(csv_path, json_path, process_func=None, canonical_fields=None,
+                refusals=None, failures=None):
     """
     Convert CSV file to JSON.
 
@@ -69,6 +73,21 @@ def csv_to_json(csv_path, json_path, process_func=None):
         csv_path: Path to input CSV file
         json_path: Path to output JSON file
         process_func: Optional function to process the dataframe before conversion
+        canonical_fields: The canonical column names this sheet's consumer
+            reads, scoping the bilingual alias map to them. None applies the
+            whole map, which is the behaviour for every sheet not yet scoped.
+        refusals: A list that receives `(source, message)` when the sheet is
+            refused, or when a sheet it reads (the glossary) is. The caller
+            decides the exit; without a list a refusal is only printed.
+        failures: A list that receives `(source, message)` when any other
+            error stops the conversion. Passed for the sheets every page
+            depends on (project, objects), whose loss fails the build. A
+            story's error is only printed: the build drops that story.
+
+    A refused sheet's earlier output is deleted, and so is a failed one's
+    when `failures` is passed. The stale-data cleanup
+    keeps any JSON whose source still exists, so without the deletion a
+    warm build would serve the last version that converted.
 
     Returns:
         bool: True if the JSON was written, False on skip (missing input) or error.
@@ -82,7 +101,12 @@ def csv_to_json(csv_path, json_path, process_func=None):
         # Read CSV file with pandas
         # Note: We can't use pandas' comment parameter because it treats # anywhere as a comment,
         # which breaks hex color codes like #2c3e50 and markdown headers (## Title) in multi-line cells
-        df = pd.read_csv(csv_path, on_bad_lines='warn')
+        # The columns matched against a fixed vocabulary are pinned to text:
+        # dtype inference reads the whole column, so a flag would otherwise
+        # mean one thing in a column with a blank cell and another in a column
+        # without one. See TEXT_COLUMNS in telar.csv_utils.
+        df = pd.read_csv(csv_path, on_bad_lines='warn',
+                         dtype=text_column_dtypes())
 
         # Filter out comment rows (first column value starts with #)
         # This handles both # and "# patterns while preserving markdown headers in multi-line cells
@@ -100,7 +124,7 @@ def csv_to_json(csv_path, json_path, process_func=None):
                 df = df.iloc[1:].reset_index(drop=True)
 
         # Normalize column names (Spanish -> English) for bilingual support
-        df = normalize_column_names(df)
+        df = normalize_column_names(df, canonical_fields)
 
         # Sanitize user data - remove Christmas tree emoji to prevent accidental triggering
         df = sanitize_dataframe(df)
@@ -130,8 +154,21 @@ def csv_to_json(csv_path, json_path, process_func=None):
         print(f"\u2713 Converted {csv_path} to {json_path}")
         return True
 
+    except (ColumnCollisionError, ReservedColumnError) as e:
+        source = getattr(e, 'source', None) or str(csv_path)
+        print(f"❌ Error converting {csv_path}: {e}")
+        if os.path.exists(json_path):
+            os.remove(json_path)
+        if refusals is not None:
+            refusals.append((source, str(e)))
+        return False
+
     except Exception as e:
         print(f"❌ Error converting {csv_path}: {e}")
+        if failures is not None:
+            if os.path.exists(json_path):
+                os.remove(json_path)
+            failures.append((str(csv_path), str(e)))
         return False
 
 
@@ -165,6 +202,21 @@ def find_csv_with_fallback(base_path, spanish_name):
 # script path itself, so the check cannot drift from the thing it checks.
 ENCRYPT_SCRIPT_MARKER = 'encrypt_protected_stories.py'
 BUILD_WORKFLOW_PATH = Path('.github/workflows/build.yml')
+
+# Exit code for "protected stories cannot be encrypted downstream", as
+# distinct from a conversion that failed. Every JSON file is already
+# written when this check runs, so what exits is a statement about a
+# future build, not about the work just done. A build step fails on any
+# non-zero and so is unaffected; the upgrade reads the value to tell a
+# site it must not stamp from a site whose owner has one thing left to do.
+PROTECTED_PREREQUISITE_EXIT = 3
+
+# Exit code for a sheet the build will not publish without: one it refuses
+# (ColumnCollisionError, ReservedColumnError), or a project or objects sheet
+# that fails to convert, since every page depends on those two. Every other
+# sheet is converted first, so one build names each of them. The upgrade treats it as any failed
+# regeneration: the site cannot publish until the sheet changes.
+SHEET_REFUSED_EXIT = 4
 
 
 def _check_protected_prerequisites(data_dir, workflow_path=None):
@@ -222,7 +274,7 @@ def _check_protected_prerequisites(data_dir, workflow_path=None):
               "story_key en _config.yml.")
         print("     Agrega 'story_key: tuclave' a _config.yml, o quita la marca "
               "'protected' de esas historias.")
-        raise SystemExit(1)
+        raise SystemExit(PROTECTED_PREREQUISITE_EXIT)
 
     # Prerequisite 2: the build workflow must run the post-build encrypt step.
     workflow = Path(workflow_path) if workflow_path else BUILD_WORKFLOW_PATH
@@ -244,10 +296,25 @@ def _check_protected_prerequisites(data_dir, workflow_path=None):
               f"scripts/{ENCRYPT_SCRIPT_MARKER}.")
         print("     Actualiza .github/workflows/build.yml según las notas de "
               "actualización, o quita la marca 'protected' de esas historias.")
-        raise SystemExit(1)
+        raise SystemExit(PROTECTED_PREREQUISITE_EXIT)
 
     print(f"{len(protected_stories)} protected story/stories will be encrypted "
           "after the Jekyll build.")
+
+
+def _report_refusals(refusals):
+    """Print each sheet the build stops on once, to stderr, where the upgrade
+    reads it.
+
+    A refused glossary is reported by every story that reads it, so the
+    list is folded by source.
+    """
+    seen = {}
+    for source, message in refusals:
+        seen.setdefault(source, message)
+    print("", file=sys.stderr)
+    for source, message in seen.items():
+        print(f"❌ {source}: {message}", file=sys.stderr)
 
 
 def _generate_audio_manifest(data_dir):
@@ -393,12 +460,17 @@ def main():
     print("Converting CSV files to JSON...")
     print("-" * 50)
 
+    refusals = []
+    failures = []
+
     # Convert project setup (with bilingual fallback: project.csv or proyecto.csv)
     project_path = find_csv_with_fallback('telar-content/spreadsheets/project', 'proyecto')
     csv_to_json(
         project_path,
         '_data/project.json',
-        process_project_setup
+        process_project_setup,
+        refusals=refusals,
+        failures=failures
     )
 
     # Convert objects (with bilingual fallback: objects.csv or objetos.csv)
@@ -410,7 +482,10 @@ def main():
     objects_ok = csv_to_json(
         objects_path,
         '_data/objects.json',
-        process_objects_func
+        process_objects_func,
+        canonical_fields=OBJECT_FIELDS,
+        refusals=refusals,
+        failures=failures
     )
 
     # The audio manifest and search index both read _data/objects.json. If the
@@ -432,10 +507,6 @@ def main():
     # v0.6.0+: Process ALL CSVs except system files
     system_csvs = {'project.csv', 'proyecto.csv', 'objects.csv', 'objetos.csv'}
 
-    process_story_func = (
-        (lambda df: process_story(df, christmas_tree=True)) if christmas_tree_mode
-        else process_story
-    )
     for csv_file in structures_dir.glob('*.csv'):
         if csv_file.name not in system_csvs:
             # --story flag: skip all story CSVs except the requested one
@@ -443,10 +514,18 @@ def main():
                 continue
             json_filename = csv_file.stem + '.json'
             json_file = data_dir / json_filename
+            # The story's name is bound per file rather than closed over:
+            # the loop variable would otherwise reach every call as
+            # whichever CSV the glob ended on.
             csv_to_json(
                 str(csv_file),
                 str(json_file),
-                process_story_func
+                lambda df, name=csv_file.stem: process_story(
+                    df,
+                    christmas_tree=christmas_tree_mode,
+                    story_name=name
+                ),
+                refusals=refusals
             )
 
     # Merge demo content if available
@@ -462,8 +541,21 @@ def main():
 
     # Protected stories: check the post-build encrypt step can actually run
     # (encryption itself happens in scripts/encrypt_protected_stories.py)
+    # A refusal outranks the protected check, but both are printed: the
+    # author has two things to fix, and learning the second only after
+    # fixing the first costs a build.
     print("-" * 50)
-    _check_protected_prerequisites(data_dir)
+    protected_exit = None
+    try:
+        _check_protected_prerequisites(data_dir)
+    except SystemExit as e:
+        protected_exit = e
+
+    if refusals or failures:
+        _report_refusals(refusals + failures)
+        raise SystemExit(SHEET_REFUSED_EXIT)
+    if protected_exit is not None:
+        raise protected_exit
 
     print("-" * 50)
     print("Conversion complete!")

@@ -10,7 +10,7 @@
  * Preserved: mobile navigation buttons, btn-home, story unlock overlay,
  * embed-mode styles, and height-based responsive tiers.
  *
- * @version v1.6.0
+ * @version v1.8.0
  */
 
 @use 'responsive' as *;
@@ -58,6 +58,44 @@
   // CRITICAL: NO z-index here — mandatory for z-index banding to work
   overflow: visible;
 
+  // EN: A card's slide, a covered card's lift and a plate's travel are one
+  //     movement seen from three places, so they run for one duration. Every
+  //     transition for a card or a plate below reads this property instead of
+  //     restating the figure. The figure here is only what stands until the
+  //     card pool writes over it at init with the pace of a move to a step,
+  //     which is the same movement measured at the scroll; `?cardmotion=0.9`
+  //     is a tuning switch for the release cycle, of the same standing as
+  //     `?cardheight=fixed`, for a card duration deliberately out of step
+  //     with the move.
+  // ES: El deslizamiento de una tarjeta, el ascenso de una tarjeta cubierta y
+  //     el recorrido de una placa son un mismo movimiento visto desde tres
+  //     puntos, así que duran lo mismo. Todas las transiciones de tarjeta o de
+  //     placa que vienen más abajo leen esta propiedad en vez de repetir la
+  //     cifra. La cifra que está aquí solo rige hasta que el card pool la
+  //     sobrescribe al arrancar con el ritmo de un desplazamiento a un paso,
+  //     que es ese mismo movimiento medido en el scroll; `?cardmotion=0.9` es
+  //     un control de ajuste para este ciclo de versiones, de la misma índole
+  //     que `?cardheight=fixed`, para una duración de tarjeta que se aparte
+  //     del desplazamiento a propósito.
+  --card-motion-duration: 0.5s;
+
+  // EN: The same movement also runs on one curve, for the same reason it runs
+  //     for one duration. The scroll eases as `1 - (1-t)³`, and the viewer's
+  //     pan and zoom is written from the scroll position every frame, so it
+  //     arrives on that curve whatever the card does. The CSS `ease-out`
+  //     keyword is a gentler function that only shares the name: over a 1.2s
+  //     move it leaves the card a fifth of its travel behind the image in the
+  //     middle, meeting it only at the end. This is that cubic as a bezier.
+  // ES: Ese mismo movimiento corre además sobre una sola curva, por lo mismo
+  //     que dura lo mismo. El scroll suaviza como `1 - (1-t)³`, y el paneo y
+  //     el zoom del visor se escriben desde la posición del scroll en cada
+  //     cuadro, así que llegan con esa curva haga lo que haga la tarjeta. La
+  //     palabra clave `ease-out` de CSS es una función más suave que solo
+  //     comparte el nombre: en un movimiento de 1.2s deja la tarjeta a un
+  //     quinto de su recorrido por detrás de la imagen en la mitad, y solo la
+  //     alcanza al final. Esta es esa cúbica escrita como bezier.
+  --card-motion-easing: cubic-bezier(0.215, 0.61, 0.355, 1);
+
   // During scroll-driven scrubbing: disable CSS transitions for per-frame control
   &.is-scrubbing .viewer-plate,
   &.is-scrubbing .text-card {
@@ -77,7 +115,7 @@
   inset: 0;
   box-sizing: border-box;
   transform: translateY(100%);                    // offscreen below by default
-  transition: transform 0.5s ease-out;           // pure slide, no fade
+  transition: transform var(--card-motion-duration) var(--card-motion-easing);  // pure slide, no fade
   // Top-edge shadow and border matching text cards (visible during slide-up)
   box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.15), 0 -6px 24px rgba(0, 0, 0, 0.12);
   border-top: 1px solid rgba(0, 0, 0, 0.1);
@@ -357,12 +395,13 @@
 
 // ── Text Card ─────────────────────────────────────────────────────────────────
 
-// Floating card over the viewer. Left-aligned at 4%, 42% wide.
+// Floating card over the viewer, on the left. Its left edge and width are the
+// side-card geometry video-layout.js reads to place a video player beside it.
 .text-card {
   container-type: inline-size; // enables @container queries below
   position: absolute;
-  left: 3%;
-  width: 37%;
+  left: $telar-card-side-left;
+  width: $telar-card-side-width;
   // height set by JS: viewportH * 0.85
   // top set by JS: centred + peek offset
   background: #fff;
@@ -371,10 +410,46 @@
   padding: 1.5rem 2rem;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  // EN: The card is a fixed-height box, so centring the content is only safe
+  //     while it fits. `justify-content: center` distributes free space even
+  //     when it is negative, which pushes the question above the card's top
+  //     edge, from where neither clipping nor scrolling returns it.
+  //     `margin-block: auto` on the card's single flex item centres short
+  //     content and top-aligns long content, because auto margins absorb free
+  //     space only while there is some.
+  //     Auto margins rather than `justify-content: safe center`: both engines
+  //     have supported flex auto margins since flexbox shipped, whereas `safe
+  //     center` needs Safari 16 and below it drops silently to top alignment.
+  //     `overflow: hidden` keeps inside the card whatever the build's answer
+  //     limit lets through: the card in horizontal neither scrolls nor
+  //     overflows onto the image, and what does not fit is cut from the
+  //     bottom, never from the top, where the question is.
+  // ES: La tarjeta tiene altura fija, así que centrar el contenido solo es
+  //     seguro mientras quepa. `justify-content: center` reparte el espacio
+  //     libre incluso cuando es negativo, lo que empuja la pregunta por encima
+  //     del borde superior de la tarjeta, de donde no la devuelven ni el
+  //     recorte ni el desplazamiento. `margin-block: auto` en el único
+  //     elemento flex de la tarjeta centra el contenido corto y alinea arriba
+  //     el contenido largo, porque los márgenes automáticos solo absorben
+  //     espacio libre mientras lo haya.
+  //     Se usan márgenes automáticos y no `justify-content: safe center`:
+  //     ambos motores admiten los márgenes automáticos de flexbox desde que
+  //     existe flexbox, mientras que `safe center` exige Safari 16 y por debajo
+  //     de esa versión pasa en silencio a la alineación superior.
+  //     `overflow: hidden` mantiene dentro de la tarjeta lo que el límite de
+  //     respuesta del build deje pasar: la tarjeta en horizontal no se desplaza
+  //     ni se desborda sobre la imagen, y lo que no quepa se corta por abajo,
+  //     nunca por arriba, donde va la pregunta.
+  justify-content: flex-start;
+  overflow: hidden;
+
+  > :only-child {
+    margin-block: auto;
+  }
+
   pointer-events: auto;
   transform: translateY(100vh);          // offscreen below by default
-  transition: transform 0.5s ease-out;
+  transition: transform var(--card-motion-duration) var(--card-motion-easing);
   // Base shadow — cards always look like cards, not flat divs
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15), 0 6px 24px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.1);
 
@@ -388,6 +463,20 @@
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 3px 10px rgba(0, 0, 0, 0.1), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
   }
 
+  // ── Variable-height side card: the covered card ────────────────────────────
+  // EN: A covered card goes away through the top when nothing rises to cover
+  //     it, and nowhere at all when a plate does. card-pool.js writes that
+  //     inline, not this sheet: a card's transform goes inline on every
+  //     activation, so a rule here would lose in the cascade. What the
+  //     stylesheet owns is the clock the travel runs on, which is the
+  //     transition above.
+  // ES: Una tarjeta cubierta se va hacia arriba y sale de la pantalla cuando
+  //     nada sube a taparla, y no va a ninguna parte cuando la que sube es una
+  //     placa. Eso lo escribe card-pool.js en línea, no esta hoja: el
+  //     `transform` de una tarjeta va en línea en cada activación, así que una
+  //     regla aquí perdería en la cascada. Lo que sí le corresponde a la hoja
+  //     de estilos es el reloj del recorrido: la transición de arriba.
+
   .step-question {
     font-family: var(--font-headings);
     font-size: 1.5rem;
@@ -396,12 +485,20 @@
     margin-bottom: 0.75rem;
   }
 
+  // EN: `.step-answer` is a grandchild of the card: card-pool.js clones the
+  //     server-rendered `.step-content` wrapper into it, and that wrapper is
+  //     the card's only flex item. So neither `flex` nor an overflow of its own
+  //     takes effect here. The card is what scrolls in vertical and what clips
+  //     in horizontal.
+  // ES: `.step-answer` es nieto de la tarjeta: card-pool.js clona dentro de ella
+  //     el contenedor `.step-content` renderizado en el servidor, y ese
+  //     contenedor es el único elemento flex de la tarjeta. Por eso, ni `flex`
+  //     ni un overflow propio surten efecto aquí. La tarjeta es la que se
+  //     desplaza en vertical y la que recorta en horizontal.
   .step-answer {
     font-size: 1rem;
     line-height: 1.6;
     color: var(--color-body);
-    overflow-y: auto;  // scroll for long text
-    flex: 1;
   }
 
   .step-actions {
@@ -414,7 +511,7 @@
   .panel-trigger {
     padding: 0.5rem 1.25rem;
     background: var(--color-button-bg);
-    color: var(--color-button-text);
+    color: var(--color-on-button);
     font-weight: 600;
     border-radius: 20px;
     font-size: 0.85rem;
@@ -483,7 +580,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: transform 0.5s ease-out;  // slides away via translateY(-120vh)
+  transition: transform var(--card-motion-duration) var(--card-motion-easing);  // slides away via translateY(-120vh)
 }
 
 .intro-floating-card {
@@ -566,23 +663,23 @@
 
   .intro-floating-card {
     .intro-title {
-      color: var(--color-panel-layer2-text);
+      color: var(--color-on-panel-layer2);
     }
 
     .intro-subtitle,
     .intro-byline,
     .intro-description {
-      color: var(--color-panel-layer2-text);
+      color: var(--color-on-panel-layer2);
       opacity: 0.85;
     }
 
     .intro-demo-label {
-      color: var(--color-panel-layer2-text);
+      color: var(--color-on-panel-layer2);
       opacity: 0.7;
     }
 
     .intro-hint {
-      color: var(--color-panel-layer2-text);
+      color: var(--color-on-panel-layer2);
       opacity: 0.5;
     }
   }
@@ -598,7 +695,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.15em;
-    color: var(--color-panel-layer2-text);
+    color: var(--color-on-panel-layer2);
     opacity: 0.5;
     margin-bottom: 0.75rem;
   }
@@ -614,7 +711,7 @@
   }
 
   .intro-toc-link {
-    color: var(--color-panel-layer2-text);
+    color: var(--color-on-panel-layer2);
     text-decoration: none;
     font-family: var(--font-headings);
     font-size: 1.05rem;
@@ -643,7 +740,7 @@
   align-items: center;
   justify-content: center;
   transform: translateY(100vh);
-  transition: transform 0.5s ease-out;
+  transition: transform var(--card-motion-duration) var(--card-motion-easing);
 
   .title-card-inner {
     text-align: center;
@@ -864,46 +961,21 @@
     max-height: $telar-card-mobile-max-height;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    transition: transform 0.4s ease-out;  // Slightly faster than desktop 0.5s
-  }
-
-  // ── Landscape-phone side card override ─────────────────────────────────────
-  // EN: When the viewport is too short for a bottom card (landscape phones,
-  //     height ≤ 480px), the side-card geometry applies instead.
-  //     Threshold 480px catches all modern landscape phones (≤ 430px tall) and
-  //     misses all portrait phones (iPhone SE 667px, SE 1st-gen 568px).
-  //     card-pool.js controls `top` via inline style with !important;
-  //     bottom: auto releases the bottom anchor so the side card positions correctly.
-  // ES: Cuando el viewport es demasiado corto para una tarjeta inferior (teléfonos
-  //     en horizontal, altura ≤ 480px), se aplica la geometría de tarjeta lateral.
-  //     El umbral de 480px captura todos los teléfonos modernos en horizontal
-  //     (≤ 430px de alto) y excluye los teléfonos en vertical (iPhone SE 667px,
-  //     SE 1.ª gen. 568px). card-pool.js
-  //     controla `top` mediante estilo inline con !important; bottom: auto libera
-  //     el ancla inferior para que la tarjeta lateral se posicione correctamente.
-  @media (max-height: $telar-card-landscape-max-height) {
-    .text-card {
-      left: 3%;
-      width: 37%;
-      top: auto !important;     // seam: card-pool sets top via style.setProperty('top', ..., 'important')
-      bottom: auto;
-      // EN: content-height side card — override the inline `height: viewportH*0.80`
-      //     that card-pool.js sets for the tall portrait/desktop card; the short
-      //     landscape viewport must size the card to its content, and card-pool
-      //     then centres it by the measured height.
-      // ES: tarjeta lateral de altura según contenido — anula el `height` en línea
-      //     (viewportH*0.80) que card-pool.js asigna a la tarjeta vertical/escritorio;
-      //     el viewport corto en horizontal debe ajustar la tarjeta a su contenido y
-      //     card-pool la centra según la altura medida.
-      height: auto !important;
-      max-height: none;
-    }
+    transition: transform calc(var(--card-motion-duration) * 0.8) var(--card-motion-easing);  // slightly faster than the desktop card
   }
 
   // dvh override for mobile text card — same structure as story-container above.
   // The $telar-card-mobile-max-height Sass var (40vh) is intentionally left as
   // the vh fallback source-of-truth; this @supports block provides the dvh value
   // at the rule level — simplest approach, no Sass var duplication.
+  //
+  // EN: The dvh cap has to precede the block that overrides for landscape: both
+  //     select `.text-card` at the same specificity, so source order decides it,
+  //     and that block's `max-height: none` only holds if it comes last.
+  // ES: El tope en dvh debe ir antes del bloque que anula para horizontal:
+  //     ambas reglas seleccionan `.text-card` con la misma especificidad, así
+  //     que lo decide el orden de aparición, y el `max-height: none` de ese
+  //     bloque solo se mantiene si va de última.
   @supports (height: 100dvh) {
     .text-card {
       max-height: 40dvh;
@@ -970,6 +1042,77 @@
     top: 25%;
   }
 
+}
+
+// ── Short-window side card ────────────────────────────────────────────────────
+// EN: When the viewport is too short for a bottom card (height ≤ 480px), the
+//     side-card geometry applies instead, at any width: on a landscape phone,
+//     which is in vertical layout, and on a short desktop window, which is not.
+//     isLandscapeSideCard() in layout-mode.js tests the same height alone, and
+//     card-pool.js sizes the card to its content on that test, so this rule is
+//     outside the vertical-layout block and carries the ceiling to both. It
+//     comes after that block so that, on a landscape phone, it overrides the
+//     bottom card's rules of the same specificity.
+//     Threshold 480px catches all modern landscape phones (≤ 430px tall) and
+//     misses all portrait phones (iPhone SE 667px, SE 1st-gen 568px).
+//     card-pool.js controls `top` via inline style with !important;
+//     bottom: auto releases the bottom anchor so the side card positions correctly.
+// ES: Cuando el viewport es demasiado bajo para una tarjeta inferior (altura
+//     ≤ 480px), se aplica en su lugar la geometría de tarjeta lateral, sea cual
+//     sea el ancho: en un teléfono en horizontal, que usa el diseño vertical
+//     (vertical-layout), y en una ventana de escritorio baja, que no lo usa.
+//     isLandscapeSideCard() de layout-mode.js comprueba únicamente esa altura,
+//     y card-pool.js ajusta la tarjeta a su contenido cuando esa comprobación
+//     se cumple, así que esta regla va por fuera del bloque vertical-layout y
+//     aplica el tope de altura en los dos casos. Va después de ese bloque para
+//     que, en un teléfono en horizontal, anule las reglas de la tarjeta
+//     inferior que tienen la misma especificidad.
+//     El umbral de 480px captura todos los teléfonos modernos en horizontal
+//     (≤ 430px de alto) y excluye los teléfonos en vertical (iPhone SE 667px,
+//     SE 1.ª gen. 568px). card-pool.js controla `top` mediante estilo en línea
+//     con !important; bottom: auto libera el ancla inferior para que la
+//     tarjeta lateral se posicione correctamente.
+@media (max-height: $telar-card-landscape-max-height) {
+  .text-card {
+    left: $telar-card-side-left;
+    width: $telar-card-side-width;
+    top: auto !important;     // seam: card-pool sets top via style.setProperty('top', ..., 'important')
+    bottom: auto;
+    // EN: content-height side card — override the inline `height: viewportH*0.80`
+    //     that card-pool.js sets for the tall portrait/desktop card; the short
+    //     landscape viewport must size the card to its content, and card-pool
+    //     then centres it by the measured height.
+    // ES: tarjeta lateral de altura según contenido — anula el `height` en línea
+    //     (viewportH*0.80) que card-pool.js asigna a la tarjeta vertical/escritorio;
+    //     el viewport corto en horizontal debe ajustar la tarjeta a su contenido y
+    //     card-pool la centra según la altura medida.
+    height: auto !important;
+    // EN: The cap is the viewport less the card's inset at top and bottom, so
+    //     the side card can use nearly the whole short viewport. Above the cap
+    //     a landscape phone's card scrolls inside, and a desktop card clips
+    //     from the bottom, as it does at any height. A cap of 40dvh is the
+    //     portrait bottom card's share of a tall viewport and leaves a
+    //     landscape card far too short; no cap at all lets the content-height
+    //     card grow past both edges of a 430px viewport, from where nothing
+    //     brings it back.
+    // ES: El tope es la altura del viewport menos la separación de la tarjeta
+    //     arriba y abajo, así que la tarjeta lateral puede ocupar casi todo el
+    //     viewport bajo. Si el contenido supera el tope, en un teléfono en
+    //     horizontal se desplaza dentro de la tarjeta, y en escritorio se corta
+    //     por abajo, como ocurre a cualquier altura. Un tope de 40dvh es la
+    //     porción que le corresponde a la tarjeta inferior en vertical dentro de
+    //     un viewport alto, y con él la tarjeta en horizontal queda demasiado
+    //     corta; sin tope alguno, la tarjeta de altura según contenido crece
+    //     hasta salirse por arriba y por abajo de un viewport de 430px, y nada
+    //     la devuelve al área visible.
+    max-height: calc(100vh - 2rem);
+
+    // The dvh value sits inside the landscape block, in the same shape as the
+    // vh-then-dvh pattern above, so the cap and its fallback stay together.
+    @supports (height: 100dvh) {
+      max-height: calc(100dvh - 2rem);
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1163,7 +1306,7 @@
   border-radius: 50px;
   cursor: pointer;
   background: var(--color-button-bg);
-  color: var(--color-button-text);
+  color: var(--color-on-button);
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 
   @media (hover: hover) and (pointer: fine) {

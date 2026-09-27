@@ -21,12 +21,12 @@
  * is already set to 'manual' in scroll-engine.js, which prevents browser
  * scroll restoration from interfering.
  *
- * @version v1.6.0
+ * @version v1.8.0
  */
 
 import { state } from './state.js';
-import { activateCard } from './card-pool.js';
-import { goToStep } from './navigation.js';
+import { activateCard, reconcileStackForJump, reconcilePlatesForJump } from './card-pool.js';
+import { goToStep, jumpButtonsTo } from './navigation.js';
 import { openPanel } from './panels.js';
 
 // ── Deep-link panel-open timer ladder ───────────────────────────────────────────
@@ -102,7 +102,8 @@ export function parseFragment(hash) {
 /**
  * Build fragment from current state and write via replaceState.
  *
- * Reads state.currentIndex (0-based). If < 0, removes the fragment entirely
+ * Reads state.currentIndex (0-based), the current step in every navigation
+ * mode. If < 0, removes the fragment entirely
  * (intro state). Otherwise builds #s{N} (1-based), and appends l{layer} if
  * a numbered layer panel is open at the top of the panel stack.
  *
@@ -175,7 +176,7 @@ function _writeHashFragment(glossaryN) {
 export function navigateToIntro() {
   // Hide all active viewer plates
   for (const plate of Object.values(state.viewerPlates)) {
-    plate.classList.remove('is-active');
+    plate.container.classList.remove('is-active');
   }
 
   if (state.lenis) {
@@ -210,11 +211,9 @@ export function navigateToStep(stepNumber) {
   const targetIndex = stepNumber - 1;
   if (targetIndex < 0 || targetIndex >= state.steps.length) return;
 
-  // Hide all active viewer plates before jumping — prevents plates from
-  // nearby steps bleeding through when the target is a title/section card.
-  for (const plate of Object.values(state.viewerPlates)) {
-    plate.classList.remove('is-active');
-  }
+  // Close every plate but the target's before jumping, or one the reader
+  // walked onto earlier is still open behind the step they land on.
+  reconcilePlatesForJump(targetIndex);
 
   if (state.lenis) {
     const targetPx = (targetIndex + 1) * window.innerHeight;
@@ -230,21 +229,14 @@ export function navigateToStep(stepNumber) {
     state.lenis.scrollTo(targetPx, { immediate: true, force: true });
     if (state.snap) state.snap.currentSnapIndex = targetIndex + 1; // keep Snap aligned (matches keyboardNav)
 
+    reconcileStackForJump(targetIndex);
     activateCard(targetIndex, 'forward');
     state.currentIndex = targetIndex;
     state.scrollPosition = targetIndex + 1;
   } else {
-    state.currentMobileStep = targetIndex;
-    state.mobileInIntro = false;
+    reconcileStackForJump(targetIndex);
     activateCard(targetIndex, 'forward');
-
-    state.steps.forEach((step, i) => {
-      if (i === targetIndex) {
-        step.classList.add('mobile-active');
-      } else {
-        step.classList.remove('mobile-active');
-      }
-    });
+    jumpButtonsTo(targetIndex);
   }
 
   writeHash();
@@ -285,24 +277,16 @@ export function applyDeepLinkOnLoad() {
     state.lenis.scrollTo(targetPx, { immediate: true, force: true });
     if (state.snap) state.snap.currentSnapIndex = targetIndex + 1; // keep Snap aligned
 
-    // Activate card and sync state
+    // Stack the cards jumped over, then activate the card and sync state
+    reconcileStackForJump(targetIndex);
     activateCard(targetIndex, 'forward');
     state.currentIndex = targetIndex;
     state.scrollPosition = targetIndex + 1;
   } else {
     // Button/mobile/iOS mode: no scroll surface — activate card directly
-    state.currentMobileStep = targetIndex;
-    state.mobileInIntro = false;
+    reconcileStackForJump(targetIndex);
     activateCard(targetIndex, 'forward');
-
-    // Ensure the correct step has the mobile-active class
-    state.steps.forEach((step, i) => {
-      if (i === targetIndex) {
-        step.classList.add('mobile-active');
-      } else {
-        step.classList.remove('mobile-active');
-      }
-    });
+    jumpButtonsTo(targetIndex);
   }
 
   // Panel state: apply after step position, with delay for card render.
@@ -315,11 +299,8 @@ export function applyDeepLinkOnLoad() {
 
       // Each deferred open also re-checks that we are still on the deep-link
       // target before acting — a backstop that covers navigation paths the
-      // interaction listener can't (e.g. a mobile nav-button tap), and the lenis
-      // vs button mode use different position fields.
-      const onTarget = () => state.lenis
-        ? state.currentIndex === targetIndex
-        : state.currentMobileStep === targetIndex;
+      // interaction listener can't (e.g. a mobile nav-button tap).
+      const onTarget = () => state.currentIndex === targetIndex;
 
       // Open layer1 first if the target is layer2 or deeper
       if (parsed.layer >= 2) {

@@ -147,6 +147,12 @@ class TestGateIsWired:
         assert 'tee jekyll-build.log' in workflow
         assert 'set -o pipefail' in workflow
 
+    def test_centering_sweep_runs_the_check(self):
+        workflow = (self.ROOT / '.github' / 'workflows' / 'centering-sweep.yml').read_text(
+            encoding='utf-8'
+        )
+        assert 'scripts/check_jekyll_conflicts.py' in workflow
+
     def test_local_builder_runs_the_check(self):
         builder = (self.ROOT / 'scripts' / 'build_local_site.py').read_text(
             encoding='utf-8'
