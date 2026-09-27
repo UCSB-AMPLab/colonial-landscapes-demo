@@ -4,10 +4,10 @@ title: "El mayorazgo y el linaje de los Maldonado"
 
 El juicio ratificó el derecho de Maldonado y Mendoza sobre su hacienda. En su testamento, Maldonado transformó su hacienda en un mayorazgo. Esto significaba que tras su muerte no se dividiría entre sus herederos sino que lo conservaría su primogénito, Antonio Maldonado de Mendoza.
 
-![](historia/def-mayorazgo.png){md}
+![Tesoro de la lengua castellana, o española. Sebastián de Covarrubias Orozco, 1611](historia/def-mayorazgo.png){md}
 Tesoro de la lengua castellana, o española.  Sebastián de Covarrubias Orozco, 1611. Cortesía de: John P. Robarts Research Library, Toronto.
 
-![](historia/1.5.jpg){md}
+![Retrato de Antonio Maldonado de Mendoza. Anónimo, siglo XVIII](historia/1.5.jpg){md}
 Retrato de Antonio Maldonado de Mendoza. Anónimo, siglo XVIII. Cortesía del Museo Colonial, Bogotá.
 
 Este es el comienzo de un poderoso linaje que se fortaleció alrededor de la hacienda.
@@ -16,6 +16,6 @@ Esta propiedad se ha conocido como la “Dehesa de Bogotá”, el mayorazgo de B
 
 Este linaje mantuvo su poder durante dos siglos, incluyendo virreyes y obispos. De hecho, [[jorge-tadeo-lozano|Jorge Tadeo Lozano,]] el primer presidente de la república en 1811, fue uno de sus descendientes.
 
-![](historia/1.5.1.jpg){sm}
-![](historia/1.5.2.jpg){sm}
+![Libro Segundo de las Genealogías del Nuevo Reyno de Granada. Juan Flórez de Ocáriz, 1674](historia/1.5.1.jpg){sm}
+![Libro Segundo de las Genealogías del Nuevo Reyno de Granada. Juan Flórez de Ocáriz, 1674](historia/1.5.2.jpg){sm}
 Libro Segundo de las Genealogías del Nuevo Reyno de Granada. Juan Flórez de Ocáriz, 1674. Cortesía de: John Carter Brown Library, Providence.

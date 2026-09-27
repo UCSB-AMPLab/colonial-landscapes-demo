@@ -6,7 +6,7 @@ Aunque en teoría las dos repúblicas debían permanecer completamente separadas
 
 De hecho, durante los siglos XVI y XVII muchos pueblos de indios contaban con una población mayor a la de ciudades como Santafé de Bogotá y Tunja. Asimismo, Santafé de Bogotá tenía una presencia notable de indígenas que se ocupaban como mercaderes, vendían víveres y bienes en la calle real y a menudo figuraban como propietarios de solares.
 
-![](historia/def-solar.jpg){md}
+![Tesoro de la lengua castellana, o española. Sebastián de Covarrubias Orozco, 1611](historia/def-solar.jpg){md}
 Tesoro de la lengua castellana, o española.  Sebastián de Covarrubias Orozco, 1611. Cortesía de John P. Robarts Research Library, Toronto.
 
 Tal era la presencia indígena en la ciudad que en 1594 el presidente de la Audiencia de Santafé, Antonio González, se vio en la necesidad de crear un nuevo cargo administrativo para un español que supervisara y controlara las actividades de este grupo.
