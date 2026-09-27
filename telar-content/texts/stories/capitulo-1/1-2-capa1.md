@@ -8,5 +8,5 @@ image: historia/def-audiencia.png
 caption: Tesoro de la lengua castellana, o española.  Sebastián de Covarrubias Orozco, 1611. Cortesía de John P. Robarts Research Library, Toronto.
 ---
 image: historia/1.2.1-.jpg
-caption: Sobre la creación de audiencias.Recopilación de Leyes de los Reinos de las Indias. [Ver documento completo](../../objects/obj3/)
+caption: Sobre la creación de audiencias. Recopilación de Leyes de los Reinos de las Indias. [Ver documento completo](../../objects/obj3/)
 :::

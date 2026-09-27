@@ -8,13 +8,13 @@ El juicio ratificó el derecho de Maldonado y Mendoza sobre su hacienda. En su t
 Tesoro de la lengua castellana, o española.  Sebastián de Covarrubias Orozco, 1611. Cortesía de: John P. Robarts Research Library, Toronto.
 
 ![](historia/1.5.jpg){md}
-Retrato de Antonio Maldonado de Mendoza.Anónimo, siglo XVIII. Cortesía del Museo Colonial, Bogotá.
+Retrato de Antonio Maldonado de Mendoza. Anónimo, siglo XVIII. Cortesía del Museo Colonial, Bogotá.
 
 Este es el comienzo de un poderoso linaje que se fortaleció alrededor de la hacienda.
 
-Esta propiedad se ha conocido como la “Dehesa de Bogotá”, el mayorazgo de Bogotá, o el Novillero y se caracterizaba por alojar temporalmente el ganado que venía de tierras bajas para su consumo en la ciudad de Santafé de Bogotá. Los herederos de Maldonado y Mendoza continuaron uniéndose con algunas de las familias más prestantes del Nuevo Reino de Granada, eventualmente recibiendo títulos nobiliarios y erigiéndose en el Marquesado de San Jorge.
+Esta propiedad se ha conocido como la “Dehesa de Bogotá”, el mayorazgo de Bogotá, o el Novillero y se caracterizaba por alojar temporalmente el ganado que venía de tierras bajas para su consumo en la ciudad de Santafé de Bogotá. Los herederos de Maldonado y Mendoza continuaron uniéndose con algunas de las familias más prestantes del Nuevo Reino de Granada, y finalmente recibieron títulos nobiliarios y se erigieron en el Marquesado de San Jorge.
 
-Este linaje mantuvo su poder durante dos siglos, incluyendo virreyes y obispos. De hecho, [[jorge-tadeo-lozano|Jorge Tadeo Lozano,]] el primer presidente de la república en 1811 fue uno de sus descendientes.
+Este linaje mantuvo su poder durante dos siglos, incluyendo virreyes y obispos. De hecho, [[jorge-tadeo-lozano|Jorge Tadeo Lozano,]] el primer presidente de la república en 1811, fue uno de sus descendientes.
 
 ![](historia/1.5.1.jpg){sm}
 ![](historia/1.5.2.jpg){sm}
