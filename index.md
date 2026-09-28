@@ -4,17 +4,8 @@ title: Home
 title_key: navigation.home
 ---
 
-{% assign lang = site.data.languages[site.telar_language] | default: site.data.languages.en %}
-<!--
-  EN: Default welcome content for this page comes from your language
-  pack (lang.index_page.welcome in _data/languages/<telar_language>.yml).
-  To replace it with your own, delete the line that follows and write
-  your welcome content here in markdown.
+Este sitio es una reconstrucción en [Telar](https://telar.org), un marco de computación mínima que entreteje imágenes IIIF, audio, video y textos en narrativas visuales por capas. Telar está basado en el formato narrativo de *Paisajes coloniales*.
 
-  ES: El contenido de bienvenida predeterminado de esta página viene
-  del paquete de idioma (lang.index_page.welcome en _data/languages/<telar_language>.yml).
-  Para reemplazarlo con el tuyo, borra la línea que sigue y escribe
-  tu contenido de bienvenida aquí en markdown.
--->
+[*Paisajes coloniales: redibujando los territorios andinos en el siglo XVII*](https://paisajescoloniales.com) es un proyecto de Santiago Muñoz Arbeláez (investigación y dirección general del proyecto), con Adelaida Ávila Cabrera (diseño y producción) y María Alejandra Orduz Avella (coordinación y desarrollo de recursos pedagógicos).
 
-{{ lang.index_page.welcome | default: site.data.languages.en.index_page.welcome | markdownify }}
+El sitio original está en [paisajescoloniales.com](https://paisajescoloniales.com).
