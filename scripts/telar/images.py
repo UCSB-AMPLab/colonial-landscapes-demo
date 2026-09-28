@@ -45,7 +45,7 @@ a nice-to-have, not a build blocker.
 Version: v1.8.0
 """
 
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 import re
 from pathlib import Path
 import urllib.request
@@ -103,8 +103,9 @@ def process_images(text, base_url=None):
     result = []
     i = 0
 
-    # Pattern for image with optional size
-    img_pattern = r'^!\[([^\]]*)\]\(([^)]+)\)(?:\{(sm|small|md|medium|lg|large|full)\})?$'
+    # Pattern for image with optional size. The alt text may hold brackets
+    # nested one level deep, as in a caption carrying a bracketed translation.
+    img_pattern = r'^!\[((?:[^\[\]]|\[[^\[\]]*\])*)\]\(([^)]+)\)(?:\{(sm|small|md|medium|lg|large|full)\})?$'
 
     while i < len(lines):
         line = lines[i]
@@ -138,7 +139,11 @@ def process_images(text, base_url=None):
                     i += 1  # Skip the caption line
 
             # Build HTML
-            img_tag = f'<img src="{html_escape(src, quote=True)}" alt="{html_escape(alt, quote=True)}"{class_attr}>'
+            # An entity the author wrote (&#91; for a literal bracket) is
+            # the character it names, so it is decoded before escaping and
+            # not published as the text "&#91;".
+            alt_attr = html_escape(html_unescape(alt), quote=True)
+            img_tag = f'<img src="{html_escape(src, quote=True)}" alt="{alt_attr}"{class_attr}>'
             if caption:
                 # Convert caption markdown to HTML (strip wrapping <p> tags)
                 caption_html = convert_markdown(
@@ -149,11 +154,31 @@ def process_images(text, base_url=None):
 
             result.append(html)
         else:
-            result.append(line)
+            result.append(_resolve_inline_images(line, base_url))
 
         i += 1
 
     return '\n'.join(result)
+
+
+_INLINE_IMAGE = re.compile(r'(!\[(?:[^\[\]]|\[[^\[\]]*\])*\]\()([^)\s]+)((?:\s+"[^"]*")?\))')
+
+
+def _resolve_inline_images(line, base_url):
+    """Resolve the path of an image written inside a line of text.
+
+    The markdown library renders it in its sentence, with no figure or
+    caption, but a relative path must resolve as a block image's does or
+    it is fetched relative to the page. Root-absolute paths and URLs are
+    the author's, left as written.
+    """
+    def resolve(match):
+        src = match.group(2)
+        if src.startswith('/') or src.startswith('http'):
+            return match.group(0)
+        return f'{match.group(1)}{base_url}/telar-content/objects/{src}{match.group(3)}'
+
+    return _INLINE_IMAGE.sub(resolve, line)
 
 
 def resolve_path_case_insensitive(base_dir, relative_path):

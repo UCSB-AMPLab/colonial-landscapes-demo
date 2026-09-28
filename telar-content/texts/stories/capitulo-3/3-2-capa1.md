@@ -4,7 +4,9 @@ title: "Una arquitectura del agua"
 
 Esto generaba una dieta rica en productos agrícolas y pescado, alternadas con carne de curíes y venado, aunque el consumo de esta última era controlado por las autoridades nativas.
 
-[[sobre-la-alimentacion-indigena|Fuente primaria]]
+:::glossary
+entry: sobre-la-alimentacion-indigena
+:::
 
 Mantener estos camellones requería una gran inversión de trabajo, y producía un paisaje agrícola que era tanto natural como humano.
 

@@ -47,7 +47,8 @@ import pandas as pd
 from telar.images import process_images
 from telar.latex import convert_markdown
 from telar.widgets import process_widgets
-from telar.glossary import process_glossary_links
+from telar.glossary import GlossaryTerms, process_glossary_links
+from telar.glossary_kinds import resolve_kind
 
 
 def load_demo_bundle():
@@ -213,10 +214,12 @@ def _write_demo_stories(bundle, data_dir):
                 steps = []
 
                 # Build glossary terms dict from bundle for link processing
-                glossary_terms = {}
+                glossary_terms = GlossaryTerms()
                 if bundle.get('glossary'):
                     for term_id, term_data in bundle['glossary'].items():
                         glossary_terms[term_id] = term_data.get('term', term_id)
+                        glossary_terms.kinds[term_id] = resolve_kind(
+                            term_data.get('kind', ''), warn=False)
 
                 for step in story_data.get('steps', []):
                     step_data = {
@@ -298,12 +301,17 @@ def _write_demo_glossary(bundle):
     if bundle.get('glossary'):
         glossary_data = []
         for term_id, term_data in bundle['glossary'].items():
-            glossary_data.append({
+            entry = {
                 'term_id': term_id,
                 'title': term_data.get('term', term_id),
                 'content': term_data.get('content', ''),
                 '_demo': True
-            })
+            }
+            # A bundle term without one is a key term, which is what the
+            # page generator makes of an entry with no kind.
+            if term_data.get('kind'):
+                entry['kind'] = term_data['kind']
+            glossary_data.append(entry)
 
         glossary_json_path = Path('_data/demo-glossary.json')
         with open(glossary_json_path, 'w', encoding='utf-8') as f:

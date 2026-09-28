@@ -57,6 +57,54 @@ class TestProcessImages:
         assert 'src="https://example.com/i.jpg"' in process_images(
             '![Alt](https://example.com/i.jpg)', base_url='/telar')
 
+    def test_alt_text_may_hold_bracketed_text(self):
+        """Brackets nested in the alt text, as in a caption carrying a
+        bracketed translation, still make an image, with its path resolved."""
+        result = process_images(
+            '![Framework of a Kogi loom [Marco de un telar kogui]]'
+            '(historia/1.3.3.1.jpg){md}', base_url='/telar')
+        assert 'src="/telar/telar-content/objects/historia/1.3.3.1.jpg"' in result
+        assert 'alt="Framework of a Kogi loom [Marco de un telar kogui]"' in result
+        assert 'class="img-md"' in result
+
+    def test_unbalanced_brackets_in_alt_text_are_not_an_image(self):
+        """An unclosed bracket makes no image, as the markdown library reads
+        it: the text is left for that library, which renders a link."""
+        text = '![A [stray bracket](photo.jpg)'
+        assert process_images(text, base_url='') == text
+
+    def test_an_entity_in_alt_text_is_the_character_it_names(self):
+        """&#91; is how a literal bracket is written; it is published as a
+        bracket, not as the text "&#91;"."""
+        result = process_images('![Loom &#91;Telar&#93;](a.jpg)', base_url='')
+        assert 'alt="Loom [Telar]"' in result
+
+    def test_markup_characters_in_alt_text_are_still_escaped(self):
+        result = process_images(
+            '![Tom &amp; Jerry & "friends" <b>](a.jpg)', base_url='')
+        assert 'alt="Tom &amp; Jerry &amp; &quot;friends&quot; &lt;b&gt;"' in result
+
+    def test_an_inline_image_resolves_its_path_as_a_block_image_does(self):
+        """An image inside a sentence stays inline, but a relative path
+        still resolves under the site's baseurl, or it 404s."""
+        result = process_images('Text ![a](x.jpg) inline', base_url='/telar')
+        assert result == 'Text ![a](/telar/telar-content/objects/x.jpg) inline'
+
+    def test_an_inline_image_keeps_author_paths_and_titles(self):
+        text = ('See ![a](/custom/x.jpg), ![b](https://e.org/y.jpg) and '
+                '![c [d]](z.jpg "Title") here')
+        assert process_images(text, base_url='/telar') == (
+            'See ![a](/custom/x.jpg), ![b](https://e.org/y.jpg) and '
+            '![c [d]](/telar/telar-content/objects/z.jpg "Title") here')
+
+    def test_an_inline_image_renders_in_its_sentence(self):
+        from telar.markdown import process_inline_content
+        out = process_inline_content('Text ![a](x.jpg) inline', [])
+        html = out.get('content') if isinstance(out, dict) else out
+        assert '<figure' not in html
+        assert 'src="x.jpg"' not in html
+        assert '/telar-content/objects/x.jpg"' in html
+
     def test_base_url_defaults_to_the_site_config(self, tmp_path, monkeypatch):
         from telar import widgets
         (tmp_path / '_config.yml').write_text('baseurl: "/mysite/"\n', encoding='utf-8')

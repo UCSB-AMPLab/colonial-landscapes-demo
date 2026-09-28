@@ -8,7 +8,9 @@ Es por esto que Antonio González, quien lideró la reforma, ordenó que cuando 
 
 Irónicamente, la nueva administración no daba mayor autonomía a los indígenas. De hecho, daba autoridad al corregidor para enviar a los indígenas a hacer trabajos forzados a las haciendas y a las minas. Este trabajo debía ser remunerado, pero los indígenas no iban a ser completamente autónomos en la utilización de los excedentes.
 
-[[demanda-contra-corregidores|Fuente primaria]]
+:::glossary
+entry: demanda-contra-corregidores
+:::
 
 Por el contrario, se especificaba que los indígenas debían introducir su dinero en un “arca de tres llaves”, un cofre especial que solo se podía abrir si se contaba simultáneamente con todas las llaves. Una de estas llaves la tendría el cacique, otra el corregidor, y una tercera el cura doctrinero. De esta manera, se podía asegurar que los indígenas pagaran sus tributos y diezmos antes de incurrir en otros gastos.
 

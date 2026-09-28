@@ -11,6 +11,8 @@ Tesoro de la lengua castellana, o española.  Sebastián de Covarrubias Orozco, 
 
 Tal era la presencia indígena en la ciudad que en 1594 el presidente de la Audiencia de Santafé, Antonio González, se vio en la necesidad de crear un nuevo cargo administrativo para un español que supervisara y controlara las actividades de este grupo.
 
-[[sobre-los-indigenas-en-la-ciudad|Fuente primaria]]
+:::glossary
+entry: sobre-los-indigenas-en-la-ciudad
+:::
 
 La distinción entre el pueblo de Bogotá y la ciudad de Santa Fe se mantuvo hasta el siglo XIX, cuando el gobierno republicano eliminó algunos nombres hispanos en su esfuerzo por crear símbolos patrios, eliminando el “Santa Fe” y dejando solo Bogotá como nombre de la ciudad y el pueblo tomando el nombre de Funza.
