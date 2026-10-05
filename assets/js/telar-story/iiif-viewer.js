@@ -11,7 +11,7 @@
  *
  * OSD is loaded via the vendored `<script>` tag at `assets/vendor/openseadragon.min.js`
  * and reached at runtime through `window.OpenSeadragon`. The
- * wrapper deliberately does NOT `import` OpenSeadragon: doing so would
+ * wrapper deliberately does not `import` OpenSeadragon: doing so would
  * either fail the esbuild bundle (if OSD is not an npm dep) or silently
  * pull the entire library into `assets/js/telar-story.js`, defeating the
  * vendoring strategy.
@@ -38,6 +38,7 @@ import { registerTestViewer, unregisterTestViewer } from './test-hook.js';
  * @property {string} manifestUrl - URL of the IIIF Presentation API manifest (v2 or v3).
  * @property {number} [startPage=0] - 0-indexed page to open initially; clamped to manifest length.
  * @property {boolean} [showChrome=false] - When true and the manifest has >1 page, inject prev/page-input/next chrome.
+ * @property {function(number): void} [onPageShown] - Called with the 0-indexed page each time a page's image has opened: the first page, then every page `setPage` asks for, once its image is in the viewer. Not called when an image fails to open, or for an image that opens after a later `setPage` has replaced it.
  * @property {boolean} [allowZoomGestures=false] - When true, leave OSD's mouse-wheel-zoom and click-to-zoom enabled. Default false because the wrapper is normally embedded in story plates whose scroll wheel belongs to Lenis (the scroll engine). Pass true on standalone object-viewer pages where there is no Lenis to fight and the reader expects scroll-to-zoom.
  */
 
@@ -90,7 +91,7 @@ export class IiifViewer {
   /**
    * @param {IiifViewerOptions} options
    */
-  constructor({ container, manifestUrl, startPage = 0, showChrome = false, allowZoomGestures = false }) {
+  constructor({ container, manifestUrl, startPage = 0, showChrome = false, allowZoomGestures = false, onPageShown = null }) {
     if (!window.OpenSeadragon) {
       throw new Error('IiifViewer: window.OpenSeadragon not loaded — vendor <script> ordering issue?');
     }
@@ -109,6 +110,7 @@ export class IiifViewer {
     this.startPage = startPage;
     this.showChrome = showChrome;
     this.allowZoomGestures = allowZoomGestures;
+    this._onPageShown = onPageShown;
     this.pages = [];
     this.currentPage = startPage;
     this.viewer = null;          // OSD instance (populated after .ready resolves)
@@ -184,19 +186,20 @@ export class IiifViewer {
       // the image briefly shows at OSD's default-centered home position
       // before snapping to the step's coordinates.
       //
-      // Timing fix: `preserveViewport: true` protects the
-      // viewport only across PAGE opens — not the very first open. OSD's
-      // initial home-fit can land AFTER a synchronous zoomTo/panTo in
-      // ready.then, resetting the viewer to home zoom. Deferring via one
-      // requestAnimationFrame after the first 'open' event lets the home-fit
-      // settle before .ready resolves, so any authored position applied in
-      // ready.then arrives AFTER the home-fit rather than racing it.
+      // `preserveViewport: true` protects the viewport only across page
+      // opens — not the very first open. OSD's initial home-fit can land after
+      // a synchronous zoomTo/panTo in ready.then, resetting the viewer to home
+      // zoom. Deferring via one requestAnimationFrame after the first 'open'
+      // event lets the home-fit finish before .ready resolves, so any authored
+      // position applied in ready.then arrives after the home-fit rather than
+      // racing it.
       //
       // 'open-failed' rejects so the catch below renders the error UI.
       await new Promise((resolve, reject) => {
-        const onFirstOpen = () => {
+        const onFirstOpen = (event) => {
           this.viewer.removeHandler('open', onFirstOpen);
           this.viewer.removeHandler('open-failed', onOpenFailed);
+          this._reportPageShown(event);
           // Defer resolution one frame so OSD's initial home-fit (which runs
           // asynchronously after the 'open' event) has settled before callers
           // apply authored pan/zoom. A single rAF is the documented minimal
@@ -215,12 +218,13 @@ export class IiifViewer {
       // Race guard for subsequent setPage() transitions.
       // `viewer.open()` is async (fetches info.json then tiles); the 'open'
       // event fires once the new tile source is fully loaded. We register
-      // this handler AFTER the initial-open await above so it only fires
+      // this handler after the initial-open await above so it only fires
       // for page-change opens, not the first load. viewer.destroy() tears
       // down its own handlers, so no explicit cleanup is needed.
-      this.viewer.addHandler('open', () => {
+      this.viewer.addHandler('open', (event) => {
         this._pageTransitioning = false;
         this._updateChrome();
+        this._reportPageShown(event);
       });
       // Companion to the 'open' handler above: if a page-change tile source
       // fails to load, 'open' never fires and _pageTransitioning would stick
@@ -258,6 +262,23 @@ export class IiifViewer {
     this._pageTransitioning = true;
     this.viewer.open(this.pages[n].tileSource);
     this._updateChrome();
+  }
+
+  /**
+   * Tell the `onPageShown` caller which page an OSD 'open' event showed.
+   *
+   * OpenSeadragon 6.0.2 drops an open superseded by a later `setPage`
+   * without raising 'open' for it, so after two quick page changes the only
+   * 'open' is the later page's. The source check keeps the report tied to
+   * the page asked for last should an 'open' arrive for any other source.
+   *
+   * @param {{source?: *}} [event] - OSD 'open' event.
+   */
+  _reportPageShown(event) {
+    if (!this._onPageShown || this._destroyed) return;
+    const page = this.pages[this.currentPage];
+    if (!page || !event || event.source !== page.tileSource) return;
+    this._onPageShown(this.currentPage);
   }
 
   /**

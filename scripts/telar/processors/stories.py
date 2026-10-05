@@ -23,19 +23,17 @@ from one story CSV and performs several passes over the data:
    references are loaded by `read_markdown_file()` from the markdown
    module; inline text is processed by `process_inline_content()`. Both
    paths run through the same pipeline: widgets first, then images, then
-   markdown-to-HTML conversion. After HTML conversion, glossary links
-   (`[[term_id]]` syntax) are resolved by `process_glossary_links()`. The
-   step's `answer` prose is glossary-processed too (the `question` is a
-   heading and is left alone), so `[[term]]` works in the main story text,
-   not only in layer panels.
+   markdown-to-HTML conversion, during which glossary links (`[[term_id]]`
+   syntax) are resolved by `process_glossary_links()`.
 
-3. **Answer limits** — the step's `answer` is prose read on a card that
-   does not scroll, so it is held to plain prose and to a length that
-   fits. `ANSWER_PROSE_RULES` says what comes out of it and what is
-   flattened, and an answer still above `ANSWER_WORD_LIMIT` words is cut
-   at a word boundary that does not land inside markup. A softer limit
-   read from `_config.yml` only warns. This pass runs on the answer as
-   the author wrote it, before glossary anchors go into it.
+3. **Answers** -- the step's `answer` is rendered to the HTML the story
+   publishes, by `render_answer()`: it renders as panels do, is made prose
+   (widgets, media, tables, code blocks, rules and footnotes come out;
+   headings, quotes and lists become paragraphs), gets glossary links, and
+   is held to the budget in `telar.answer_budget`, the length that fits the
+   side card without scrolling. An answer over it is cut, and `answer_long`
+   says whether the answer is set in the smaller type. The `question` is a
+   heading and is left as written.
 
 4. **Coordinates** — empty `x`, `y`, and `zoom` cells get default
    values (0.5, 0.5, 1) so the viewer always has a valid starting
@@ -58,18 +56,21 @@ Version: v1.8.0
 
 import html
 import math
+import numbers
 import re
 import json
-from collections import namedtuple
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 
+from telar.answer_budget import (ANSWER_BUDGET, MAX_PARAGRAPHS, Measure, cut_to_budget,
+                                 html_tokens, measure_answer, small_type, within_budget)
 from telar.config import get_lang_string
 from telar.glossary import load_glossary_terms, process_glossary_links
-from telar.markdown import read_markdown_file, process_inline_content
+from telar.markdown import process_inline_content, read_markdown_file, render_markdown
 from telar.csv_utils import IMAGE_EXTENSIONS, build_stem_index
-from telar.latex import has_latex, latex_spans
+from telar.latex import has_latex
 from telar.media_type import AUDIO_EXTENSIONS
 
 
@@ -80,132 +81,12 @@ def _warn(msg, warnings):
 
 
 
-ANSWER_WORD_LIMIT = 200
-"""Words a step's answer may hold before the build cuts it.
-
-Above this the answer is unreadable rather than merely long: on the desktop
-layout the side card never scrolls, so everything past the card's edge is
-clipped and no reader can reach it. The tightest common laptop cells hold
-225 words at 1280x720, 264 at 1366x768 and 275 at 1440x757, and this limit
-sits under that floor with a margin for a larger type size.
-
-The Compositor reads this constant by name, from this module, for a parity
-test against its own editor-side limit, so the name and the module path are
-part of that shared contract and cannot move quietly.
-"""
-
 ANSWER_MEDIA = 'media'
 ANSWER_WIDGETS = 'widgets'
 ANSWER_FOOTNOTES = 'footnotes'
 ANSWER_MARKUP = 'markup'
 
-_ProseRule = namedtuple('_ProseRule', 'name kind pattern replacement')
-
-ANSWER_PROSE_RULES = (
-    _ProseRule(
-        'widget', ANSWER_WIDGETS,
-        re.compile(r'^[ \t]*:::[A-Za-z0-9_]+[ \t]*\n[\s\S]*?^[ \t]*:::[ \t]*$\n?',
-                   re.MULTILINE),
-        ''),
-    _ProseRule(
-        'fenced code block', ANSWER_MARKUP,
-        re.compile(r'^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*\n?',
-                   re.MULTILINE),
-        ''),
-    _ProseRule(
-        'table', ANSWER_MARKUP,
-        re.compile(r'^[^\n|]*\|[^\n]*\n'
-                   r'[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*'
-                   r'(?:\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*\n'
-                   r'(?:[^\n]*\|[^\n]*\n?)*',
-                   re.MULTILINE),
-        ''),
-    _ProseRule(
-        'image or embed', ANSWER_MEDIA,
-        re.compile(r'!\[(?:[^\[\]]|\[[^\[\]]*\])*\]\([^)]*\)'
-                   r'|<(img|iframe|video|audio|embed|object)\b[^>]*>'
-                   r'(?:.*?</\1\s*>)?',
-                   re.IGNORECASE | re.DOTALL),
-        ''),
-    _ProseRule(
-        'footnote definition', ANSWER_FOOTNOTES,
-        re.compile(r'^[ \t]*\[\^[^\]]*\]:.*(?:\n[ \t]+\S.*)*\n?',
-                   re.MULTILINE),
-        ''),
-    _ProseRule(
-        'footnote reference', ANSWER_FOOTNOTES,
-        re.compile(r'\[\^[^\]]*\]'),
-        ''),
-    _ProseRule(
-        'horizontal rule', ANSWER_MARKUP,
-        re.compile(r'^[ \t]{0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}'
-                   r'|(?:_[ \t]*){3,})$\n?',
-                   re.MULTILINE),
-        ''),
-    _ProseRule(
-        'blockquote mark', ANSWER_MARKUP,
-        re.compile(r'^[ \t]*(?:>[ \t]?)+', re.MULTILINE),
-        ''),
-    _ProseRule(
-        'heading mark', ANSWER_MARKUP,
-        re.compile(r'^[ \t]*#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$', re.MULTILINE),
-        r'\1'),
-    _ProseRule(
-        'list marker', ANSWER_MARKUP,
-        re.compile(r'^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+', re.MULTILINE),
-        ''),
-)
-"""Everything a step's answer is not allowed to be, in the order applied.
-
-A step's answer is plain prose. The Compositor mirrors this set on the
-editor side and reads this list as the contract, so both the expressions
-and their order are part of it.
-
-Removed outright, with the words inside them:
-
-  - **widget** -- a `:::name` line through the next line that is `:::`
-    alone, which is the block the widget pass renders in a panel. It runs
-    first, so a carousel's images and a callout's lines go with it and
-    are reported once, as a widget. Widgets do not go in a step's answer;
-    they belong in a layer panel.
-  - **fenced code block** -- ``` or ~~~ through its matching fence.
-  - **table** -- a pipe-table block: a row carrying a pipe, a delimiter
-    row, and the body rows that follow while they carry one.
-  - **image or embed** -- markdown image syntax, and the HTML elements
-    that bring their own media (img, iframe, video, audio, embed,
-    object), opening tag through closing tag where one exists.
-  - **footnote definition** -- a line opening `[^n]:`, through the
-    indented continuation lines that belong to it.
-  - **footnote reference** -- `[^n]` in the prose. It runs after the
-    definition rule, which would otherwise be left holding a bare colon.
-  - **horizontal rule** -- a line of three or more dashes, asterisks or
-    underscores. It runs before the list rule, which would read `* * *`
-    as a bullet.
-
-Flattened, losing their marks and keeping their words:
-
-  - **blockquote mark** -- the leading `>`, every level of it. It runs
-    before the heading and list rules, so a quoted heading or bullet
-    reaches them.
-  - **heading mark** -- the ATX `#` marks, leading and closing.
-  - **list marker** -- the bullet or number opening a list item.
-
-Untouched, because they are prose: bold, italics, inline links,
-`[[term]]`, inline LaTeX, code spans, paragraph breaks.
-
-Detection runs on the raw markdown with no awareness of code spans, so
-image syntax inside backticks goes too. The rules have to be expressions
-the Compositor can implement identically, and a step's answer is prose
-about an object rather than a markdown tutorial. A bare image URL is
-text and stays.
-
-Nothing repairs the whitespace a removal leaves behind: each rule takes
-out what it matched and nothing else, so an answer carrying none of these
-comes back byte for byte and markdown decides what the rest means.
-"""
-
-# The order warnings are reported in, one per answer per kind, whatever
-# order the rules that fired sit in.
+# The order warnings are reported in, one per answer per kind.
 ANSWER_KINDS = (ANSWER_MEDIA, ANSWER_WIDGETS, ANSWER_FOOTNOTES, ANSWER_MARKUP)
 
 # What each kind is called in the message catalogue.
@@ -216,137 +97,238 @@ _ANSWER_KIND_KEYS = {
     ANSWER_MARKUP: 'answer_markup_flattened',
 }
 
-# Markup a cut must not land inside. Each of these is one thing to a reader
-# and to the renderer, so half of one publishes as broken syntax rather than
-# as a shortened answer. LaTeX comes from telar.latex, which owns the
-# question of what maths looks like. A footnote reference is absent because
-# the prose rules have already taken it out.
-_ANSWER_ATOMIC = [
-    re.compile(r'\[\[[^\]]*\]\]'),        # glossary reference
-    re.compile(r'\[[^\]]*\]\([^)]*\)'),   # markdown link
-    re.compile(r'`[^`]*`'),               # code span
-    re.compile(r'<[^>]+>'),               # inline HTML tag
-]
 
-# The token that ends a cut answer. One character, so the count of words
-# before it stays the count this module reports.
-_ANSWER_ELLIPSIS = '…'
+def _line_starts(text):
+    """The index at which each line of *text* begins."""
+    starts = [0]
+    pos = text.find('\n')
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = text.find('\n', pos + 1)
+    return starts
 
 
-def _count_answer_words(text):
-    """The number of words in *text*, by the rule the Compositor shares.
 
-    Trim, split on Unicode whitespace, count the non-empty tokens. Markup
-    and URLs are words, because they take up the card like any other text,
-    and a non-breaking space separates words like any other whitespace.
+_WIDGET_OPEN = re.compile(r'[ \t]*:::[A-Za-z0-9_]+[ \t]*\n')
+_WIDGET_CLOSE = re.compile(r'[ \t]*:::[ \t]*(?=\n|\Z)')
+
+
+def _remove_widget_blocks(text):
+    """*text* without its widget blocks, and how many were removed.
+
+    An opening is a line of optional blanks, `:::`, a name of letters,
+    digits and underscores, and optional blanks. The block ends after the
+    first later line that is `:::` alone between optional blanks, and one
+    optional newline. An opening with no such line after it opens nothing.
+    Reading resumes on the first line start after the block.
     """
-    return len(str(text).split())
+    starts = _line_starts(text)
+    total = len(starts)
+    # next_close[i] is the first line from i on that is `:::` alone.
+    next_close = [total] * (total + 1)
+    for i in range(total - 1, -1, -1):
+        next_close[i] = i if _WIDGET_CLOSE.match(text, starts[i]) \
+            else next_close[i + 1]
+
+    pieces = []
+    kept = 0
+    removed = 0
+    i = 0
+    while i < total - 1:
+        if _WIDGET_OPEN.match(text, starts[i]) and next_close[i + 1] < total:
+            j = next_close[i + 1]
+            end = _WIDGET_CLOSE.match(text, starts[j]).end()
+            if text[end:end + 1] == '\n':
+                end += 1
+            pieces.append(text[kept:starts[i]])
+            kept = end
+            removed += 1
+            i = j + 1
+        else:
+            i += 1
+    pieces.append(text[kept:])
+    return ''.join(pieces), removed
 
 
-def _reduce_answer_to_prose(text):
-    """*text* as plain prose, and the kinds of thing that came out of it.
+# Elements a step's answer loses with everything inside them, by the kind
+# each is reported as. A void element among them has nothing inside.
+_ANSWER_DROPPED = {
+    'img': ANSWER_MEDIA, 'iframe': ANSWER_MEDIA, 'video': ANSWER_MEDIA,
+    'audio': ANSWER_MEDIA, 'embed': ANSWER_MEDIA, 'object': ANSWER_MEDIA,
+    'table': ANSWER_MARKUP, 'pre': ANSWER_MARKUP, 'hr': ANSWER_MARKUP,
+}
+_ANSWER_HEADINGS = frozenset(f'h{level}' for level in range(1, 7))
+_ANSWER_UNWRAPPED = frozenset({'blockquote', 'ul', 'ol'})
+# The two pieces the footnotes extension writes: a reference's `<sup>` and
+# the notes' `<div>`.
+_FOOTNOTE_PART = re.compile(r'<(?:sup\b[^>]*\bid="fnref|div\b[^>]*\bclass="footnote")')
+_EMPTY_PARAGRAPH = re.compile(r'<p\b[^>]*>\s*</p>\n?')
 
-    Applies ANSWER_PROSE_RULES in order; that constant's docstring is the
-    whole of what the rules are and why they run in that order. The kinds
-    come back in ANSWER_KINDS order rather than in the order the rules
-    fired, so one answer earns one warning per kind and always the same
-    sequence of them.
+
+class _AnswerProse:
+    """A step's rendered answer as prose: `html`, and the `kinds` of thing
+    that came out of it.
+
+    Media, tables, code blocks, horizontal rules and footnotes are removed
+    with what is inside them. A heading becomes a paragraph, a quote and a
+    list lose their container, and each list item becomes a paragraph, so
+    their words stay. A paragraph left empty is removed. Everything else --
+    emphasis, links, code spans, line breaks, raw inline HTML -- is kept as
+    rendered.
     """
-    fired = set()
-    for rule in ANSWER_PROSE_RULES:
-        text, count = rule.pattern.subn(rule.replacement, text)
-        if count:
-            fired.add(rule.kind)
 
-    return text, [kind for kind in ANSWER_KINDS if kind in fired]
+    def __init__(self, rendered):
+        self.out, self.kinds = [], set()
+        self._dropping = None
+        self._items = []
+        for token in html_tokens(rendered):
+            self._take(token)
+        self.html = _EMPTY_PARAGRAPH.sub('', ''.join(self.out))
+
+    def _take(self, token):
+        if self._dropping:
+            self._skip(token)
+        elif self._drops(token):
+            return
+        elif token.name in _ANSWER_HEADINGS:
+            self.kinds.add(ANSWER_MARKUP)
+            self._end_item()
+            self.out.append('<p>' if token.kind == 'start' else '</p>')
+        elif token.name in _ANSWER_UNWRAPPED:
+            self.kinds.add(ANSWER_MARKUP)
+            self._end_item()
+        elif token.name == 'li':
+            self._list_item(token)
+        else:
+            if token.name == 'p' and token.kind == 'start':
+                self._end_item()
+            self.out.append(token.raw)
+
+    def _drops(self, token):
+        """Whether *token* opens or is something the answer loses."""
+        if token.kind not in ('start', 'void', 'end'):
+            return False
+        kind = _ANSWER_DROPPED.get(token.name)
+        if kind is None and token.kind == 'start' and _FOOTNOTE_PART.match(token.raw):
+            kind = ANSWER_FOOTNOTES
+        if kind is None:
+            return False
+        self.kinds.add(kind)
+        if token.kind == 'start':
+            self._dropping = [token.name, 1]
+        return True
+
+    def _skip(self, token):
+        name, depth = self._dropping
+        if token.name != name:
+            return
+        depth += 1 if token.kind == 'start' else -1 if token.kind == 'end' else 0
+        self._dropping = [name, depth] if depth else None
+
+    def _list_item(self, token):
+        self.kinds.add(ANSWER_MARKUP)
+        if token.kind == 'start':
+            self._end_item()
+            self.out.append('<p>')
+            self._items.append(True)
+        elif self._items and self._items.pop():
+            self.out.append('</p>')
+
+    def _end_item(self):
+        """Close the paragraph a list item opened, before a block inside it."""
+        if self._items and self._items[-1]:
+            self.out.append('</p>')
+            self._items[-1] = False
 
 
-def _answer_atomic_spans(text):
-    """Every span in *text* a cut must fall outside of."""
-    spans = [(match.start(), match.end())
-             for pattern in _ANSWER_ATOMIC
-             for match in pattern.finditer(text)]
-    spans.extend(latex_spans(text))
-    return spans
+class RenderedAnswer(NamedTuple):
+    """A step's answer as the build publishes it (`render_answer`).
 
-
-def _cut_answer(text, limit):
-    """*text* shortened to at most *limit* words, closed with an ellipsis.
-
-    The cut lands on a word boundary, and never inside markup. A boundary
-    that falls within a link, a glossary or footnote reference, a code
-    span, a LaTeX span or an HTML tag moves back to the start of that
-    markup and then back to the nearest earlier boundary, repeating until
-    it is clear -- so an answer that ends near markup publishes shorter
-    than the limit rather than broken at it.
-
-    A token holding no whitespace cannot be split this way, because a word
-    boundary never falls inside one.
+    `html` is the published answer. `kinds` names what came out of it, in
+    ANSWER_KINDS order. `measure` is the answer's words, paragraphs and
+    lines before any cut (`telar.answer_budget`), `cut` says whether it
+    was over ANSWER_BUDGET and so cut, and `long` whether the published
+    answer is set in the smaller type.
     """
-    boundaries = [match.end() for match in re.finditer(r'\S+', text)]
-    if len(boundaries) <= limit:
-        return text
-
-    spans = _answer_atomic_spans(text)
-    cut = boundaries[limit - 1]
-    while True:
-        straddled = [start for start, end in spans if start < cut < end]
-        if not straddled:
-            break
-        cut = min(straddled)
-        earlier = [end for end in boundaries if end <= cut]
-        cut = earlier[-1] if earlier else 0
-
-    return text[:cut] + _ANSWER_ELLIPSIS
+    html: str
+    kinds: list
+    measure: Measure
+    cut: bool
+    long: bool
 
 
-def _limit_answers(df, story_name, warnings, answer_warnings):
-    """Hold every step's answer to text only, and to a readable length.
+def render_answer(text, glossary_terms=None, glossary_warnings=None, step=None,
+                  source='answer'):
+    """A step's answer, as written, rendered to the HTML the build publishes.
 
-    Runs on the answer exactly as the author typed it, ahead of the
-    glossary pass, so the word count is the author's own words and the
-    markup the cut protects is the markup they wrote rather than the
-    anchors Telar injects.
+    Widget blocks are removed from the text. The rest renders as every
+    piece of author markdown does (`render_markdown`), and then, while its
+    maths is still held out of the HTML: it is made prose (`_AnswerProse`),
+    `[[term]]` becomes a glossary link as in a panel, and an answer over
+    ANSWER_BUDGET is cut (`telar.answer_budget`). The cut runs last, so it
+    counts the words a reader sees and never splits a glossary link.
 
-    An answer over ANSWER_WORD_LIMIT is cut and reported. Length on its
-    own earns no report: the build speaks where it has changed the
-    author's words and stays quiet where it has not.
+    Args:
+        text: The answer as the author wrote it.
+        glossary_terms: The glossary's term ids and titles, or None.
+        glossary_warnings: A list for glossary reports, or None.
+        step: The step, for glossary reports.
+        source: What a warning about unclosed HTML calls the answer.
 
-    The prose rules run first, so the count is of the words that survive
-    them: a list of two hundred bulleted words is two hundred words, and a
-    footnote the rules removed weighs nothing.
+    Returns:
+        RenderedAnswer
+    """
+    text = str(text).replace('\r\n', '\n').replace('\r', '\n').strip()
+    text, widgets = _remove_widget_blocks(text)
+    found = {}
+
+    def to_prose(rendered):
+        prose = _AnswerProse(rendered)
+        linked = process_glossary_links(prose.html, glossary_terms,
+                                        glossary_warnings, step, None)
+        found['kinds'], found['measure'] = prose.kinds, measure_answer(linked)
+        return cut_to_budget(linked)
+
+    published = render_markdown(text, source, post_process=to_prose)
+    kinds = found['kinds'] | ({ANSWER_WIDGETS} if widgets else set())
+    return RenderedAnswer(published, [kind for kind in ANSWER_KINDS if kind in kinds],
+                          found['measure'], not within_budget(found['measure']),
+                          small_type(measure_answer(published)))
+
+
+def _render_answers(df, story_name, glossary_terms, glossary_warnings, warnings,
+                    answer_warnings):
+    """Every step's answer rendered to the HTML published in its `answer`.
+
+    What `render_answer` took out of an answer is reported once per kind,
+    and an answer over the budget is reported with its count, naming the
+    story and step: the build speaks where it has changed the author's
+    words and stays quiet where it has not.
     """
     if 'answer' not in df.columns:
         return df
 
+    df['answer_long'] = False
     story = story_name or 'unknown'
-
     for idx, row in df.iterrows():
         raw = str(row['answer'])
         if not raw.strip():
             continue
-
         step = row.get('step', 'unknown')
         label = _step_label(step)
-        answer = raw
-
-        answer, kinds = _reduce_answer_to_prose(answer)
-        for kind in kinds:
-            _report_answer(
-                _ANSWER_KIND_KEYS[kind], step, answer_warnings, warnings,
-                story=story, step_label=label)
-
-        count = _count_answer_words(answer)
-        if count > ANSWER_WORD_LIMIT:
-            answer = _cut_answer(answer, ANSWER_WORD_LIMIT)
-            _report_answer(
-                'answer_over_hard_limit', step, answer_warnings, warnings,
-                story=story, step_label=label, count=count,
-                limit=ANSWER_WORD_LIMIT)
-
-        if answer != raw:
-            df.at[idx, 'answer'] = answer
-
+        rendered = render_answer(raw, glossary_terms, glossary_warnings, step,
+                                 source=f'the answer to step {label} of {story}')
+        for kind in rendered.kinds:
+            _report_answer(_ANSWER_KIND_KEYS[kind], step, answer_warnings, warnings,
+                           story=story, step_label=label)
+        if rendered.cut:
+            counted = rendered.measure
+            _report_answer('answer_over_hard_limit', step, answer_warnings, warnings,
+                           story=story, step_label=label, lines=counted.lines,
+                           limit=ANSWER_BUDGET, max_paragraphs=MAX_PARAGRAPHS,
+                           paragraphs=counted.paragraphs)
+        df.at[idx, 'answer'] = rendered.html
+        df.at[idx, 'answer_long'] = rendered.long
     return df
 
 
@@ -387,9 +369,8 @@ def _normalise_frame(df):
 def _step_label(step):
     """The step as its author wrote it, not as pandas typed it.
 
-    A page column with a blank in it makes pandas read the whole sheet's
-    step numbers as floats, so a warning about step 1 said "step 1.0".
-    Only the label is normalised; the offending value is quoted exactly as
+    pandas reads step numbers as floats when the column has a blank, so a
+    whole-number float is shown as an integer. Only the label is normalised; the offending value is quoted exactly as
     it was read, because that is the author's own data.
     """
     if isinstance(step, float) and step.is_integer():
@@ -397,14 +378,29 @@ def _step_label(step):
     return str(step)
 
 
+def _report_step(step):
+    """The step a report carries into the story JSON.
+
+    A report takes its step from the frame, as numpy gives it when read
+    with `df.at` (`int64`, which `json.dump` refuses, so the story was not
+    written) or as a float when the column has a blank or a fraction (`1.0`,
+    which the intro panel prints). A finite whole number becomes an int and
+    a finite fraction a float. Anything else numpy or the author can put in
+    the column -- `True`, `inf` -- is written as text, which `json.dump`
+    takes and which is still valid JSON.
+    """
+    if (isinstance(step, numbers.Real) and not isinstance(step, bool)
+            and math.isfinite(step)):
+        return int(step) if float(step).is_integer() else float(step)
+    return step if isinstance(step, str) else str(step)
+
+
 def _page_value(raw, step, warnings):
     """One cell as a page number, or '' with a warning.
 
     float() runs first because a spreadsheet writes a whole number as
-    3.0. OverflowError joins the caught set because it is what
-    int(float('Infinity')) raises, and it is a sibling of ValueError
-    rather than a subclass -- omitting it crashed the build on a cell a
-    person can type by hand.
+    3.0. OverflowError is caught because int(float('Infinity')) raises it
+    and it is a sibling of ValueError rather than a subclass.
     """
     if not pd.notna(raw) or not str(raw).strip():
         return ''
@@ -428,25 +424,15 @@ def _validate_page_column(df, warnings):
     nowhere, so an unusable value is cleared and said out loud rather
     than carried into the JSON.
 
-    The column is rebuilt rather than written cell by cell, and that is
-    the whole of why this function looks like this. pandas gives a column
-    a dtype from what it read, and refuses a value of another type into
-    it:
-
-      - a column pandas read as text (one typo beside real page numbers)
-        rejected the integer, so every *valid* page in that column was
-        cleared and reported as invalid;
-      - a column pandas read as numbers (a 0 from someone counting from
-        zero, beside a blank) rejected the empty string used to clear it,
-        and the TypeError escaped this function and stopped the build.
-
-    Assigning the whole column at once replaces its dtype instead of
-    fighting it, so neither case arises.
+    The column is assigned whole. pandas gives a column a dtype from what
+    it read and refuses a value of another type into it, so per-cell
+    assignment fails on a text column holding page numbers and on a numeric
+    column holding a blank. Assigning the whole column replaces its dtype.
     """
     if 'page' not in df.columns:
         return df
 
-    df['page'] = [_page_value(row.get('page', ''), row.get('step', 'unknown'),
+    df['page'] = [_page_value(row['page'], row.get('step', 'unknown'),
                               warnings)
                   for _, row in df.iterrows()]
     return df
@@ -468,13 +454,7 @@ def _load_objects_data():
     try:
         with open(objects_json_path, 'r', encoding='utf-8') as f:
             objects_list = json.load(f)
-            # Keyed by id, and only by records that have one. The objects
-            # build drops a blank id before it writes this file, so its own
-            # output never carries a null here; the guard is because this
-            # reads a file from disk rather than a frame it produced, and the
-            # matcher lowercases every key, which a null does not survive.
-            return {obj['object_id']: obj for obj in objects_list
-                    if isinstance(obj.get('object_id'), str) and obj['object_id']}
+            return {obj['object_id']: obj for obj in objects_list}
     except Exception as e:
         print(f"  [WARN] Could not load objects.json for validation: {e}")
         return None
@@ -581,7 +561,7 @@ def _validate_object_references(df, objects_data, warnings):
     return df
 
 
-def _layer_content_for(cell_value, widget_warnings):
+def _layer_content_for(cell_value, widget_warnings, post_process=None):
     """One layer cell as content, from a file or from the cell itself.
 
     A value ending in `.md` names a file; anything else is prose typed
@@ -603,12 +583,19 @@ def _layer_content_for(cell_value, widget_warnings):
         else:
             # Try to load as markdown file
             file_path = f"stories/{cell_value}"
-            content_data = read_markdown_file(file_path, widget_warnings)
+            content_data = read_markdown_file(file_path, widget_warnings, post_process)
 
     # If not a file reference or file not found, treat as inline content
     if content_data is None:
-        content_data = process_inline_content(cell_value, widget_warnings)
+        content_data = process_inline_content(cell_value, widget_warnings, post_process)
     return content_data
+
+def _glossary_linker(glossary_terms, glossary_warnings, step_num, layer):
+    """The pass that makes a panel's glossary links, given its rendered
+    HTML while the maths is still held out of it."""
+    return lambda rendered: process_glossary_links(
+        rendered, glossary_terms, glossary_warnings, step_num, layer)
+
 
 def _process_content_columns(df, glossary_terms, glossary_warnings, widget_warnings):
     """Turn every layer column into HTML, from a file or from the cell.
@@ -646,47 +633,16 @@ def _process_content_columns(df, glossary_terms, glossary_warnings, widget_warni
                     step_num = row.get('step', 'unknown')
 
                     content_data = _layer_content_for(
-                        cell_value, widget_warnings)
+                        cell_value, widget_warnings,
+                        _glossary_linker(glossary_terms, glossary_warnings,
+                                         step_num, base_name))
 
                     if content_data:
                         df.at[idx, title_col] = content_data['title']
-                        # Apply glossary link transformation to content
-                        content_with_glossary = process_glossary_links(
-                            content_data['content'],
-                            glossary_terms,
-                            glossary_warnings,
-                            step_num,
-                            base_name
-                        )
-                        df.at[idx, text_col] = content_with_glossary
+                        df.at[idx, text_col] = content_data['content']
 
             # Drop the _content/_file column: it is not part of the JSON output
             df = df.drop(columns=[col])
-    return df
-
-
-def _resolve_answer_glossary(df, glossary_terms, glossary_warnings):
-    """Resolve [[term]] in the step's answer prose.
-
-    The answer only. The question is the step's heading, and an inline
-    link does not belong in one, so [[term]] there is left literal. The
-    answer is still markdown at this point -- Liquid renders it later --
-    so the transform runs on the markdown string, and the anchor it
-    injects passes through markdownify unchanged.
-    """
-    # None because this is step prose, not a layer panel.
-    if 'answer' in df.columns:
-        for idx, row in df.iterrows():
-            cell_value = row['answer']
-            if cell_value and str(cell_value).strip():
-                step_num = row.get('step', 'unknown')
-                df.at[idx, 'answer'] = process_glossary_links(
-                    str(cell_value),
-                    glossary_terms,
-                    glossary_warnings,
-                    step_num,
-                    None
-                )
     return df
 
 
@@ -696,10 +652,10 @@ def _apply_coordinate_defaults(df):
     coordinate_defaults = {'x': '0.5', 'y': '0.5', 'zoom': '1'}
     for col, default in coordinate_defaults.items():
         if col in df.columns:
-            # Convert to string first to handle NaN values
+            # Blank cells are '' by now. A typed `nan` is text like `NA`,
+            # and is reported by the coordinate check, not defaulted.
             df[col] = df[col].astype(str)
-            # Set defaults for empty or 'nan' values
-            df.loc[df[col].isin(['', 'nan']), col] = default
+            df.loc[df[col] == '', col] = default
     return df
 
 
@@ -880,12 +836,12 @@ def process_story(df, christmas_tree=False, story_name=''):
     answer_warnings = []
 
     df = _normalise_frame(df)
-    df = _limit_answers(df, story_name, warnings, answer_warnings)
     df = _validate_page_column(df, warnings)
     df = _validate_object_references(df, _load_objects_data(), warnings)
     df = _process_content_columns(df, glossary_terms, glossary_warnings,
                                   widget_warnings)
-    df = _resolve_answer_glossary(df, glossary_terms, glossary_warnings)
+    df = _render_answers(df, story_name, glossary_terms, glossary_warnings,
+                         warnings, answer_warnings)
     df = _apply_coordinate_defaults(df)
     coordinate_warnings = []
     df = _check_coordinates(df, story_name, warnings, coordinate_warnings)
@@ -895,6 +851,9 @@ def process_story(df, christmas_tree=False, story_name=''):
     all_warnings.extend(glossary_warnings)
     all_warnings.extend(widget_warnings)
     all_warnings.extend(answer_warnings)
+    for report in all_warnings:
+        if 'step' in report:
+            report['step'] = _report_step(report['step'])
     df.attrs['viewer_warnings'] = all_warnings
 
     df.attrs['has_latex'] = _detect_latex(df)

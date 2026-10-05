@@ -36,6 +36,9 @@ import { writeHash, writeHashWithGlossary } from './deep-link.js';
 
 // ── Panel open / close ───────────────────────────────────────────────────────
 
+/** The story's panels, each the element `#panel-{type}`. */
+const PANEL_TYPES = ['layer1', 'layer2', 'glossary'];
+
 /**
  * Set up click handlers for panel trigger buttons and back buttons.
  *
@@ -97,7 +100,7 @@ export function initializePanels() {
   // Bootstrap can dismiss a panel without going through closePanel (the
   // offcanvas X button uses data-bs-dismiss), so panel state is reconciled
   // on hidden.bs.offcanvas — the one event every dismissal path fires.
-  ['layer1', 'layer2', 'glossary'].forEach((panelType) => {
+  PANEL_TYPES.forEach((panelType) => {
     const panel = document.getElementById(`panel-${panelType}`);
     if (!panel) return;
     panel.addEventListener('hidden.bs.offcanvas', function () {
@@ -106,12 +109,147 @@ export function initializePanels() {
       if (state.panelStack.length !== before) {
         writeHash();
       }
-      if (!document.querySelector('.offcanvas.show')) {
+      if (!anyPanelOpen()) {
         state.isPanelOpen = false;
         deactivateScrollLock();
       }
+      // The entry number recorded by writeHashWithGlossary goes with the entry,
+      // unless a newer entry has already reopened the panel.
+      if (panelType === 'glossary' && !panel.classList.contains('show')) {
+        panel.removeAttribute('data-deep-link-n');
+      }
+      settleFocusTraps();
     });
+    panel.addEventListener('shown.bs.offcanvas', settleFocusTraps);
   });
+
+  initializeShareHandoff();
+}
+
+/**
+ * A panel's or the Share dialog's Bootstrap focus trap, or null.
+ *
+ * Bootstrap 5.3.0, which the layouts pin, keeps the trap on the component
+ * instance as `_focustrap`, with its state in `_isActive`; neither is public,
+ * so a change of Bootstrap version has to be checked against this helper. All
+ * traps share one set of document listeners: `activate()` replaces whichever
+ * trap held them, and `deactivate()` on a trap marked active removes them for
+ * every trap. `activate()` does nothing on a trap already marked active, so
+ * `hold()` clears the mark first. `release()` reports whether the trap was
+ * marked active, that is whether it removed the listeners.
+ *
+ * @param {Element|null} el - A panel or the Share dialog.
+ * @param {Function} Component - `bootstrap.Offcanvas` for a panel, `bootstrap.Modal` for Share.
+ * @returns {{isHeld: function(): boolean, hold: function(): void, release: function(): boolean}|null}
+ */
+function focusTrap(el, Component) {
+  const instance = el && Component.getInstance(el);
+  const trap = instance?._focustrap;
+  if (!trap) return null;
+  return {
+    isHeld: () => trap._isActive,
+    hold: () => { trap.deactivate(); trap.activate(); },
+    release: () => {
+      const held = trap._isActive;
+      trap.deactivate();
+      return held;
+    },
+  };
+}
+
+/** Whether the Share dialog is open, from the start of its show to the end of its hide. */
+let shareOpen = false;
+
+/** Whether a panel is open and not closing. */
+const isSettledOpen = (el) => el.classList.contains('show') && !el.classList.contains('hiding');
+
+/**
+ * The topmost panel that is open and not closing, or null.
+ *
+ * The stack orders the panels; a panel Bootstrap closed without the stack (its
+ * X button) leaves it only once hidden, so a closing panel is skipped.
+ */
+function topmostOpenPanel() {
+  const els = state.panelStack.map((p) => document.getElementById(`panel-${p.type}`));
+  const fromStack = els.reverse().find((el) => el && isSettledOpen(el));
+  if (fromStack) return fromStack;
+  const open = PANEL_TYPES.map((t) => document.getElementById(`panel-${t}`))
+    .filter((el) => el && isSettledOpen(el));
+  return open[open.length - 1] || null;
+}
+
+/** Release every panel's trap; true if one of them held the document listeners. */
+function releasePanelTraps(except = null) {
+  return PANEL_TYPES.map((t) => document.getElementById(`panel-${t}`))
+    .filter((el) => el && el !== except)
+    .map((el) => focusTrap(el, bootstrap.Offcanvas)?.release())
+    .some(Boolean);
+}
+
+/**
+ * Give the one active focus trap to whatever is on top.
+ *
+ * Bootstrap activates a panel's trap when the panel finishes opening and
+ * deactivates it when the panel starts to close, without regard to the panels
+ * below or to the Share dialog. While Share is open it holds focus and no
+ * panel's trap may; a panel trap that was active has taken the listeners from
+ * Share, which gets them back. Otherwise the topmost open, non-closing panel's
+ * trap is the one active, and every other panel's is released.
+ */
+function settleFocusTraps() {
+  if (shareOpen) {
+    const share = document.getElementById('panel-share');
+    const shareTrap = focusTrap(share, bootstrap.Modal);
+    const shareHeld = shareTrap?.isHeld();
+    if (releasePanelTraps() && shareHeld) shareTrap.hold();
+    return;
+  }
+  const top = topmostOpenPanel();
+  releasePanelTraps(top);
+  if (top) focusTrap(top, bootstrap.Offcanvas)?.hold();
+}
+
+/**
+ * Hand focus and keys to the Share dialog while it is open over a panel, and
+ * back to the topmost panel when it closes.
+ *
+ * Share opens over panels that stay open. A panel's focus trap sends focus
+ * that leaves the panel back into it, so the panels' traps stay off while
+ * Share shows, including one that finishes opening meanwhile. On close the
+ * topmost open panel's trap is restored and focus goes to that panel, after
+ * Bootstrap has returned it to the Share button, which sits outside the panel.
+ */
+function initializeShareHandoff() {
+  const share = document.getElementById('panel-share');
+  if (!share) return;
+
+  share.addEventListener('show.bs.modal', () => {
+    shareOpen = true;
+    releasePanelTraps();
+  });
+  share.addEventListener('hidden.bs.modal', () => {
+    shareOpen = false;
+    settleFocusTraps();
+    // Bootstrap's own return of focus to the Share button runs after this
+    // listener; the move into the panel has to come after it.
+    setTimeout(() => topmostOpenPanel()?.focus(), 0);
+  });
+}
+
+/**
+ * Whether any of the story's panels is open, opening or still closing, so the
+ * story stays frozen.
+ *
+ * The stack holds a panel from its open until its close is asked for, so one
+ * that has begun to slide in while another slides out keeps the story frozen
+ * when the other's close completes. A panel whose close has been asked for
+ * leaves the stack at once but keeps `show` until its slide out ends. Only the
+ * story's own panels count: another offcanvas on the page has no close that
+ * would lift the lock.
+ */
+function anyPanelOpen() {
+  return state.panelStack.length > 0
+    || PANEL_TYPES.some((t) => document.getElementById(`panel-${t}`)?.classList.contains('show'));
 }
 
 /**
@@ -120,7 +258,7 @@ export function initializePanels() {
  * The panel freezes the story as a layer does. The URL fragment is not
  * rewritten: it names layers only, and a glossary link writes its own g{n}.
  */
-export function joinGlossaryToStack() {
+function joinGlossaryToStack() {
   const top = state.panelStack[state.panelStack.length - 1];
   if (top?.type !== 'glossary') {
     state.panelStack.push({ type: 'glossary', id: null });
@@ -225,8 +363,7 @@ export function closePanel(panelType) {
 
   // Wait for Bootstrap animation before checking panel state
   setTimeout(() => {
-    const anyPanelOpen = document.querySelector('.offcanvas.show');
-    if (!anyPanelOpen) {
+    if (!anyPanelOpen()) {
       state.isPanelOpen = false;
       deactivateScrollLock();
     }
@@ -246,21 +383,16 @@ export function closeTopPanel() {
 }
 
 /**
- * Close all open panels and deactivate scroll lock.
+ * Close every open panel, topmost first, each as its own back button closes
+ * it.
+ *
+ * The stack, the fragment and the scroll lock go as they do for any close, so
+ * the story stays frozen until the last panel has gone. A control that moves
+ * the story while panels are open (Back to Start, a contents link) closes them
+ * here before it moves.
  */
 export function closeAllPanels() {
-  const openPanels = document.querySelectorAll('.offcanvas.show');
-  openPanels.forEach(panel => {
-    const bsOffcanvas = bootstrap.Offcanvas.getInstance(panel);
-    if (bsOffcanvas) {
-      bsOffcanvas.hide();
-    }
-  });
-
-  state.panelStack = [];
-  state.isPanelOpen = false;
-  writeHash();
-  deactivateScrollLock();
+  [...state.panelStack].reverse().forEach((p) => closePanel(p.type));
 }
 
 // ── Panel content ────────────────────────────────────────────────────────────
@@ -423,7 +555,7 @@ export function initializeScrollLock() {
  *
  * Also stops Lenis so wheel events do not cause scroll position changes
  * while a panel is open. Safe to call when Lenis is not initialised
- * (mobile/iOS/embed) — optional chaining skips the call silently.
+ * (button navigation) — the call is skipped.
  */
 export function activateScrollLock() {
   state.scrollLockActive = true;
@@ -438,7 +570,7 @@ export function activateScrollLock() {
  * Deactivate scroll lock — allows step navigation and hides backdrop.
  *
  * Also resumes Lenis after a panel closes. Safe to call when Lenis is
- * not initialised (mobile/iOS/embed).
+ * not initialised (button navigation).
  */
 export function deactivateScrollLock() {
   state.scrollLockActive = false;

@@ -13,84 +13,166 @@ import re
 import shutil
 from pathlib import Path
 
-import pandas as pd
-
 from telar.images import process_images
-from telar.glossary import process_glossary_links, load_glossary_terms
-from telar.markdown import read_markdown_file, process_inline_content
+from telar.glossary import (first_at_each_address, glossary_link_map, glossary_term_address,
+                            place_demo_terms, markdown_glossary_title,
+                            process_glossary_links, read_glossary_sheet)
+from telar.markdown import process_inline_content, read_markdown_file, render_markdown
 from telar.core import find_csv_with_fallback
-from telar.latex import convert_markdown, has_latex
+from telar.latex import has_latex
 from telar.frontmatter import FRONTMATTER_PATTERN, _as_text, _frontmatter_block
-from telar.story_pages import jekyll_slug
 from telar.glossary_kinds import front_matter_kind, resolve_kind, write_site_kinds
 
 
-def _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms):
+def _csv_page_rows(csv_path, warn_missing=True):
+    """The rows of glossary.csv that become pages, as (term_id, title, row).
+
+    The one decision of which site terms are published from a CSV: a sheet
+    missing a required column publishes none, a row without an id or a
+    title, or whose id starts with `#`, is not a term, and of rows whose ids
+    share an address the first keeps it. `warn_missing` says whether a
+    missing column and a shared address are reported; the link map reads
+    the sheet once per story and leaves the report to the generator.
+    """
+    df = read_glossary_sheet(csv_path)
+
+    for col in ['term_id', 'title', 'definition']:
+        if col not in df.columns:
+            if warn_missing:
+                print(f"  ⚠️ glossary.csv missing required column: {col}")
+            return []
+
+    rows = []
+    for _, row in df.iterrows():
+        term_id = str(row['term_id']).strip()
+        title = str(row['title']).strip()
+        if not term_id or not title or term_id.startswith('#'):
+            continue
+        rows.append((term_id, title, row))
+    kept = first_at_each_address(
+        [(term_id, (term_id, title, row)) for term_id, title, row in rows], warn_missing)
+    return [item for _id, item in kept]
+
+
+def _csv_pages(rows):
+    """The `site_glossary_pages` entries of `_csv_page_rows`' rows."""
+    pages = {}
+    for term_id, title, row in rows:
+        pages[term_id] = (title, resolve_kind(row.get('kind', ''), warn=False))
+    return pages
+
+
+def _split_markdown_term(content):
+    """(frontmatter_text, body, term_id) of a legacy glossary file; the
+    first is None without front matter, the last without a term_id."""
+    match = FRONTMATTER_PATTERN.match(content)
+    if not match:
+        return None, None, None
+    frontmatter_text = match.group(1)
+    term_id_match = re.search(r'term_id:\s*(\S+)', frontmatter_text)
+    return (frontmatter_text, match.group(2).strip(),
+            term_id_match.group(1) if term_id_match else None)
+
+
+# A top-level `permalink` key with its value, which may run over indented
+# continuation lines.
+_PERMALINK_KEY = re.compile(r'^["\']?permalink["\']?[ \t]*:.*(?:\n[ \t]+.*)*', re.MULTILINE)
+
+
+def _pin_permalink(frontmatter_text, term_id, source_file, warn):
+    """`frontmatter_text` with its `permalink`, if any, replaced by the
+    term's own address, which is where every glossary page is published.
+    The replacement is reported when `warn` is set."""
+    address = glossary_term_address(term_id)
+    pinned, count = _PERMALINK_KEY.subn(lambda _match: f'permalink: {address}',
+                                        frontmatter_text)
+    if count and warn:
+        print(f"  ⚠️ Glossary entry '{term_id}' ({source_file.name}): its permalink "
+              f"is replaced by {address}, where every glossary page is published. "
+              f"Remove the permalink line from the file.")
+    return pinned
+
+
+def _markdown_terms(md_path, warn=True):
+    """The legacy glossary files that become pages, in file-name order, as
+    (source_file, frontmatter_text, body, term_id).
+
+    A file without front matter or a `term_id` is not a term. A page is
+    always published at `/glossary/<slug>/`, so a `permalink` in its front
+    matter is replaced (`_pin_permalink`), and of files whose ids share a
+    slug the first keeps it (`first_at_each_address`). `warn` says whether
+    these are reported.
+    """
+    terms = []
+    for source_file in sorted(md_path.glob('*.md')):
+        with open(source_file, 'r', encoding='utf-8') as f:
+            frontmatter_text, body, term_id = _split_markdown_term(f.read())
+        if frontmatter_text is None:
+            if warn:
+                print(f"Warning: No frontmatter found in {source_file}")
+            continue
+        if not term_id:
+            if warn:
+                print(f"Warning: No term_id found in {source_file}")
+            continue
+        frontmatter_text = _pin_permalink(frontmatter_text, term_id, source_file, warn)
+        terms.append((term_id, (source_file, frontmatter_text, body, term_id)))
+    return [item for _id, item in first_at_each_address(terms, warn)]
+
+
+def _markdown_pages(terms):
+    """The `site_glossary_pages` entries of `_markdown_terms`' files. A page
+    without a `title` shows its term id."""
+    pages = {}
+    for _source, frontmatter_text, _body, term_id in terms:
+        pages[term_id] = (markdown_glossary_title(frontmatter_text) or term_id,
+                          resolve_kind(front_matter_kind(frontmatter_text), warn=False))
+    return pages
+
+
+def site_glossary_pages(warn_missing=True):
+    """The site's own glossary pages as {term_id: (title, kind id)}, the
+    title and kind as the page shows them, chosen as `generate_glossary`
+    chooses its source: glossary.csv when present, else the legacy markdown
+    files. `warn_missing` is passed to `_csv_page_rows` and
+    `_markdown_terms`.
+    """
+    csv_path = Path(find_csv_with_fallback('telar-content/spreadsheets/glossary', 'glosario'))
+    md_path = Path('telar-content/texts/glossary')
+    if csv_path.exists():
+        return _csv_pages(_csv_page_rows(csv_path, warn_missing))
+    if md_path.exists():
+        return _markdown_pages(_markdown_terms(md_path, warn_missing))
+    return {}
+
+
+def _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms, rows=None):
     """Generate glossary files from CSV.
 
     Args:
         csv_path: Path to glossary.csv
         glossary_dir: Output directory for Jekyll files
         glossary_terms: Dict of term_id -> title for link processing
+        rows: `_csv_page_rows(csv_path)` when the caller has already read
+            the sheet; read here otherwise
     """
-    # Every column here is text the author typed. Left to infer, pandas
-    # reads a term titled `null` or `NA` as a missing value and the page
-    # is written `nan`, and it decides per column, so the same title
-    # survives or does not depending on what its neighbours look like.
-    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-
-    # Normalize column names (bilingual mapping), then fold what is left.
-    # The order is the whole point. Folding first left two spellings of one
-    # column as one label written twice, which the collision refusal cannot
-    # tell from a single column; the refusal runs on the headers as the
-    # author wrote them, so it sees `Note` beside `note`.
-    #
-    # The fold still has to happen, after. `Term_ID` is nobody's alias, so
-    # the bilingual map leaves it alone and only the fold makes it findable
-    # under `term_id` below. A hand-edited glossary headed that way built
-    # before, and refusing it at upgrade over the casing of its own headers
-    # would be a regression, not a fix.
-    from telar.csv_utils import (normalize_column_names, is_header_row,
-                                 ColumnCollisionError, ReservedColumnError,
-                                 GLOSSARY_COLUMN_ALIASES)
-    try:
-        df = normalize_column_names(df, sheet_aliases=GLOSSARY_COLUMN_ALIASES)
-    except (ColumnCollisionError, ReservedColumnError) as e:
-        e.source = str(csv_path)
-        raise
-    df.columns = df.columns.str.lower().str.strip()
-
-    # Filter out instruction columns starting with #
-    df = df[[col for col in df.columns if not col.startswith('#')]]
-
-    # Drop duplicate header row (bilingual CSVs have Spanish aliases in row 2)
-    if len(df) > 0 and is_header_row(df.iloc[0].values,
-                                     sheet_aliases=GLOSSARY_COLUMN_ALIASES):
-        df = df.iloc[1:].reset_index(drop=True)
-
-    required_cols = ['term_id', 'title', 'definition']
-    for col in required_cols:
-        if col not in df.columns:
-            print(f"  ⚠️ glossary.csv missing required column: {col}")
-            return
-
-    for _, row in df.iterrows():
-        term_id = str(row.get('term_id', '')).strip()
-        title = str(row.get('title', '')).strip()
-        definition = str(row.get('definition', '')).strip()
+    if rows is None:
+        rows = _csv_page_rows(csv_path)
+    for term_id, title, row in rows:
+        definition = str(row['definition']).strip()
         related_terms_raw = str(row.get('related_terms', '')).strip()
-
-        if not term_id or not title:
-            continue
-
-        # Skip comment/instruction rows (e.g. "# Make it lower-case...")
-        if term_id.startswith('#'):
-            continue
 
         # Parse related_terms (pipe-separated)
         related_terms = []
-        if related_terms_raw and related_terms_raw != 'nan':
+        if related_terms_raw:
             related_terms = [t.strip() for t in related_terms_raw.split('|') if t.strip()]
+
+        # Glossary-to-glossary links are made while the definition renders,
+        # with its maths held out of the HTML.
+        warnings_list = []
+
+        def link_terms(rendered):
+            return process_glossary_links(rendered, glossary_terms, warnings_list)
 
         # Process definition: file reference or inline content
         # If definition looks like a filename (short, no spaces/newlines), try as file first
@@ -99,20 +181,16 @@ def _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms):
         if looks_like_filename:
             file_def = definition if definition.endswith('.md') else f'{definition}.md'
             glossary_path = file_def if file_def.startswith('glossary/') else f'glossary/{file_def}'
-            content_data = read_markdown_file(glossary_path)
+            content_data = read_markdown_file(glossary_path, post_process=link_terms)
         else:
             content_data = None
 
         if content_data:
-            body = content_data['content']
+            processed = content_data['content']
         else:
             # No file found or inline content — treat as inline
-            content_data = process_inline_content(definition)
-            body = content_data['content'] if content_data else ''
-
-        # Process glossary-to-glossary links
-        warnings_list = []
-        processed = process_glossary_links(body, glossary_terms, warnings_list)
+            content_data = process_inline_content(definition, post_process=link_terms)
+            processed = content_data['content'] if content_data else ''
 
         for warning in warnings_list:
             print(f"  Warning: {warning}")
@@ -141,45 +219,29 @@ def _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms):
         print(f"✓ Generated {filepath}")
 
 
-def _generate_glossary_from_markdown(md_path, glossary_dir, glossary_terms):
+def _generate_glossary_from_markdown(md_path, glossary_dir, glossary_terms, terms=None):
     """Generate glossary files from markdown (legacy method).
 
     Args:
         md_path: Path to telar-content/texts/glossary/
         glossary_dir: Output directory for Jekyll files
         glossary_terms: Dict of term_id -> title for link processing
+        terms: `_markdown_terms(md_path)` when the caller has already read
+            the files; read here otherwise
     """
-    for source_file in md_path.glob('*.md'):
-        # Read the source markdown file
-        with open(source_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        # Parse frontmatter and body
-        match = FRONTMATTER_PATTERN.match(content)
-
-        if not match:
-            print(f"Warning: No frontmatter found in {source_file}")
-            continue
-
-        # Verbatim. Normalising it means cutting lines out of the author's
-        # text or reading their frontmatter and writing it back, and both
-        # decide what a file means: a cut is truncated by a blank line or a
-        # comment and hands the remainder to the key above it, and a
-        # rewrite unquotes a date the author quoted, which Ruby then reads
-        # as a Date. So a list-valued key such as `related_terms` reaches
-        # the page exactly as the author typed it, and has to be a YAML
-        # list: the layout iterates it, and Liquid walks a scalar string as
-        # one item, so `a,b` is looked up as a single id matching no term.
-        frontmatter_text = match.group(1)
-        body = match.group(2).strip()
-
-        # Extract term_id to determine output filename
-        term_id_match = re.search(r'term_id:\s*(\S+)', frontmatter_text)
-        if not term_id_match:
-            print(f"Warning: No term_id found in {source_file}")
-            continue
-
-        term_id = term_id_match.group(1)
+    if terms is None:
+        terms = _markdown_terms(md_path)
+    for source_file, frontmatter_text, body, term_id in terms:
+        # The front matter is copied verbatim. Normalising it means cutting
+        # lines out of the author's text or reading their frontmatter and
+        # writing it back, and both decide what a file means: a cut is
+        # truncated by a blank line or a comment and hands the remainder to
+        # the key above it, and a rewrite unquotes a date the author quoted,
+        # which Ruby then reads as a Date. So a list-valued key such as
+        # `related_terms` reaches the page exactly as the author typed it,
+        # and has to be a YAML list: the layout iterates it, and Liquid
+        # walks a scalar string as one item, so `a,b` is looked up as a
+        # single id matching no term.
         filepath = glossary_dir / f"{term_id}.md"
 
         # Written as a key of its own after the author's front matter, which
@@ -194,14 +256,13 @@ def _generate_glossary_from_markdown(md_path, glossary_dir, glossary_terms):
         # 1. Process images (size syntax and captions)
         processed = process_images(body)
 
-        # 2. Convert markdown to HTML
-        processed = convert_markdown(
-            processed,
-            extensions=['extra', 'nl2br', 'sane_lists']
-        )
-
-        # 3. Process glossary links ([[term]] syntax)
-        processed = process_glossary_links(processed, glossary_terms, warnings_list)
+        # 2. Convert markdown to HTML, with glossary links ([[term]] syntax)
+        # made while maths is held out of the HTML
+        processed = render_markdown(
+            processed, str(source_file),
+            post_process=lambda rendered: process_glossary_links(
+                rendered, glossary_terms, warnings_list),
+            extra_extensions=('sane_lists',))
 
         # Print any warnings
         for warning in warnings_list:
@@ -231,6 +292,33 @@ layout: glossary{latex_flag}
         print(f"✓ Generated {filepath}")
 
 
+def _demo_glossary_fields(term, term_id):
+    """The front matter of a demo glossary entry's page."""
+    fields = {'term_id': _as_text(term_id),
+              'title': _as_text(term.get('title', term_id)),
+              'glossary_kind': resolve_kind(
+                  term.get('kind', ''),
+                  where=f"Demo glossary entry '{term_id}'"),
+              'layout': 'glossary',
+              # The layout tests this as a boolean.
+              'demo': True}
+    # A sequence, as a site's entry writes it: the layout iterates it.
+    if term.get('related_terms'):
+        fields['related_terms'] = [_as_text(related)
+                                   for related in term['related_terms']]
+    if has_latex(term.get('content', '')):
+        fields['has_latex'] = True
+    return fields
+
+
+def _report_demo_skip(placement):
+    """Print why `place_demo_terms` did not write a demo term's page."""
+    term_id = placement.term_id
+    print(f"  ⚠️ Demo glossary term '{term_id}' skipped: another "
+          f"glossary term is published at {glossary_term_address(term_id)}, "
+          f"which is kept.")
+
+
 def generate_glossary():
     """Generate glossary markdown files from user content and demo JSON.
 
@@ -240,6 +328,10 @@ def generate_glossary():
     - _data/demo-glossary.json (demo content from bundle)
 
     If both CSV and markdown exist, CSV takes precedence and a warning is shown.
+
+    Returns the site's link map (`load_glossary_terms()`'s), so the pages
+    that run after it need not read the sheet again: each warning the read
+    raises is printed once per run.
     """
     glossary_dir = Path('_jekyll-files/_glossary')
 
@@ -254,22 +346,33 @@ def generate_glossary():
     # so a kind removed from _config.yml leaves the page with the rest.
     write_site_kinds()
 
-    # Load glossary terms for link processing (enables glossary-to-glossary linking)
-    glossary_terms = load_glossary_terms()
-
     csv_path = Path(find_csv_with_fallback('telar-content/spreadsheets/glossary', 'glosario'))
     md_path = Path('telar-content/texts/glossary')
 
-    # 1. Process user glossary from CSV (preferred) or markdown (legacy)
+    # The link map and the pages come from one read of the sheet, so a
+    # warning that read raises is printed once.
+    csv_rows = None
+    markdown_terms = None
     if csv_path.exists():
+        csv_rows = _csv_page_rows(csv_path)
+        site_pages = _csv_pages(csv_rows)
+    elif md_path.exists() and any(md_path.glob('*.md')):
+        markdown_terms = _markdown_terms(md_path)
+        site_pages = _markdown_pages(markdown_terms)
+    else:
+        site_pages = {}
+    glossary_terms = glossary_link_map(site_pages)
+
+    # 1. Process user glossary from CSV (preferred) or markdown (legacy)
+    if csv_rows is not None:
         # Warn if markdown files also exist
         if md_path.exists() and any(md_path.glob('*.md')):
             print(f"  ⚠️ Found both glossary.csv and markdown files. Using CSV.")
 
-        _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms)
+        _generate_glossary_from_csv(csv_path, glossary_dir, glossary_terms, csv_rows)
 
-    elif md_path.exists() and any(md_path.glob('*.md')):
-        _generate_glossary_from_markdown(md_path, glossary_dir, glossary_terms)
+    elif markdown_terms is not None:
+        _generate_glossary_from_markdown(md_path, glossary_dir, glossary_terms, markdown_terms)
 
     # 2. Process demo glossary from JSON
     demo_glossary_path = Path('_data/demo-glossary.json')
@@ -277,35 +380,21 @@ def generate_glossary():
         with open(demo_glossary_path, 'r', encoding='utf-8') as f:
             demo_glossary = json.load(f)
 
-        # The directory was emptied above, so what it holds now is the
-        # site's own glossary. Compared by slug, not file name: Jekyll
-        # publishes `Viewer.md` and `viewer.md` both at /glossary/viewer/,
-        # and a case-insensitive disk holds them as one file.
-        site_slugs = {jekyll_slug(path.stem)
-                      for path in glossary_dir.glob('*.md')}
+        # Jekyll publishes `Viewer.md` and `viewer.md` both at
+        # /glossary/viewer/. `place_demo_terms` decides which demo
+        # terms are written, as the demo stories' link map does.
+        demo_terms = [term for term in demo_glossary if term.get('term_id', '')]
+        placements = place_demo_terms(site_pages,
+                                      [term['term_id'] for term in demo_terms])
 
-        for term in demo_glossary:
-            term_id = term.get('term_id', '')
-            if not term_id:
+        for term, placement in zip(demo_terms, placements):
+            term_id = placement.term_id
+            if not placement.written:
+                _report_demo_skip(placement)
                 continue
-
-            if jekyll_slug(term_id) in site_slugs:
-                print(f"  ⚠️ Demo glossary term '{term_id}' skipped: the "
-                      f"site's glossary has a term at the same address, "
-                      f"which is kept.")
-                continue
-
             filepath = glossary_dir / f"{term_id}.md"
 
-            # Create markdown with frontmatter
-            fields = {'term_id': _as_text(term_id),
-                      'title': _as_text(term.get('title', term_id)),
-                      'glossary_kind': resolve_kind(
-                          term.get('kind', ''),
-                          where=f"Demo glossary entry '{term_id}'"),
-                      'layout': 'glossary',
-                      # The layout tests this as a boolean.
-                      'demo': True}
+            fields = _demo_glossary_fields(term, term_id)
             output_content = ('---\n' + _frontmatter_block(fields)
                               + '---\n\n' + term.get('content', '') + '\n')
 
@@ -313,3 +402,5 @@ def generate_glossary():
                 f.write(output_content)
 
             print(f"✓ Generated {filepath} [DEMO]")
+
+    return glossary_terms

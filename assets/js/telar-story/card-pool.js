@@ -1,5 +1,5 @@
 /**
- * Telar Story – Card Pool
+ * Telar Story – Card Stack
  *
  * This module owns three distinct lifecycles in the card-stack layout:
  *
@@ -9,7 +9,7 @@
  *      evicted. Visibility is controlled entirely by CSS transforms, so
  *      slide transitions animate correctly without the jank of DOM
  *      insertion and removal. What a card is for — its step, its object, its
- *      place in the run — is written on the element, so there is one answer
+ *      place in the scene — is written on the element, so there is one answer
  *      to each of those questions rather than a map and a record that can
  *      disagree.
  *
@@ -21,12 +21,12 @@
  *      object type is writing a file in plates/, not finding the places
  *      that branch.
  *
- *   3. The viewers inside the image plates. These genuinely pool: the
+ *   3. The viewers inside the image plates, which form the viewer pool: the
  *      number holding a live OpenSeadragon instance is capped at
  *      config.maxViewerCards, and when over the cap the plate farthest by
  *      scene distance from the current position is unloaded. The plate
- *      stays; only the viewer in it goes. The player types pool their own,
- *      inside their own modules, on their own caps.
+ *      stays; only the viewer in it goes. The player types keep their own
+ *      pools, inside their own modules, on their own caps.
  *
  * Scene maps — a story step references an object by ID, but the same
  * object can appear in multiple non-contiguous scenes (A → B → A). To
@@ -35,11 +35,11 @@
  * index, not by object ID, so each appearance of an object gets its own
  * plate element.
  *
- * Z-index banding — each scene occupies a band of 100 z-index values.
+ * Z-ranges — each scene occupies a z-range of 100 z-index values.
  * Scene 0 gets 100–199, scene 1 gets 200–299, and so on. The viewer
- * plate sits at the band base; text cards sit at base + 1 + their
- * run position within consecutive steps of the same object. This ensures
- * that newer plates always stack above all cards from the previous scene.
+ * plate sits at the range base; text cards sit at base + 1 + their
+ * position within the scene. This ensures that newer plates always stack
+ * above all cards from the previous scene.
  *
  * Context-sensitive stacking — when the user navigates to a new step,
  * the module decides what to do based on whether the object changed.
@@ -71,7 +71,7 @@
  * @version v1.8.0
  */
 
-import { state } from './state.js';
+import { state, moveSeconds } from './state.js';
 import { detectCardType } from './card-type.js';
 import { updateObjectCredits } from './viewer.js';
 import { getBasePath, escapeHtml } from './utils.js';
@@ -79,11 +79,16 @@ import {
   computeFocalTarget,
   reSnapActiveViewer,
   _deriveCardPlacement,
+  visibleImageRegion,
+  framePlacement,
 } from './iiif-card.js';
-import { onViewportResize, onLayoutChange, getLayoutMode, isLandscapeSideCard } from './layout-mode.js';
-import { isFitHeight, applyCardMotionDuration } from './card-height.js';
+import { onViewportResize, onLayoutChange, getLayoutMode, isPhoneHeightSideCard } from './layout-mode.js';
+import { setMoveSeconds } from './card-height.js';
 import { isFullObjectMode } from './text-card.js';
-import { arrangeMediaScene } from './media-arrangement.js';
+import { arrangeMediaScene, measureTopBand } from './media-arrangement.js';
+import {
+  fitSideCards, publishSideCardWidth, sideCardBand, sideCardTop, timeGeometryPass, watchCardContent,
+} from './card-fit.js';
 import { MediaPlate } from './plates/media-plate.js';
 import { VideoPlate } from './plates/video-plate.js';
 import { AudioPlate } from './plates/audio-plate.js';
@@ -91,11 +96,11 @@ import { IiifPlate } from './plates/iiif-plate.js';
 
 // ── Z-index scenes ────────────────────────────────────────────────────────────
 //
-// A "scene" is a contiguous run of steps sharing the same background object.
-// Each object change starts a new scene, even if returning to a previously-
-// seen object.  Scenes are numbered from 0.
+// A scene is consecutive steps on the same object. Each object change starts
+// a new scene, even if returning to a previously-seen object.  Scenes are
+// numbered from 0.
 //
-// Each scene gets a z-index band of 100:
+// Each scene gets a z-range of 100:
 //   Scene 0 → viewer plate 100, text cards 101, 102, 103...
 //   Scene 1 → viewer plate 200, text cards 201, 202...
 //   Scene 2 → viewer plate 300, text cards 301...
@@ -118,7 +123,7 @@ import { IiifPlate } from './plates/iiif-plate.js';
  */
 export function computeZIndexPlan(steps) {
   let scene = -1;
-  let runPos = 0;
+  let scenePos = 0;
   let currentObjectId = null;
   let titleCounter = 0;
   const plateZ = {};
@@ -129,19 +134,19 @@ export function computeZIndexPlan(steps) {
     const effectiveId = objectId === '' ? '__title_' + (titleCounter++) + '__' : objectId;
     if (effectiveId !== currentObjectId) {
       scene++;
-      runPos = 0;
+      scenePos = 0;
       currentObjectId = effectiveId;
     }
-    // Cap the band so stories with >98 unique scenes do not overflow into the
+    // Cap the z-range so stories with >98 unique scenes do not overflow into the
     // fixed-UI / panel chrome z-index reserve. Warn once when the cap engages.
     if (scene === 97) {
       console.warn('[Telar] Story has more than 98 unique scenes; z-index ' +
-        'banding is clamped at 9800 and panel/UI chrome layering may overlap.');
+        'ranges are clamped at 9800 and panel/UI chrome layering may overlap.');
     }
-    const bandBase = Math.min((scene + 1) * 100, 9800);
-    plateZ[i] = bandBase;
-    textCardZ[i] = bandBase + 1 + runPos;
-    runPos++;
+    const rangeBase = Math.min((scene + 1) * 100, 9800);
+    plateZ[i] = rangeBase;
+    textCardZ[i] = rangeBase + 1 + scenePos;
+    scenePos++;
   }
 
   return { plateZ, textCardZ };
@@ -189,7 +194,7 @@ export function getCardMessiness(seed, messinessPercent) {
 }
 
 /**
- * A card's place in its run, read from the card.
+ * A card's place in its scene, read from the card.
  *
  * `_createTextCards` writes it to the element and `_recomputeCardGeometry`
  * reads it back from there, so the element is where it lives; a parallel copy
@@ -198,40 +203,38 @@ export function getCardMessiness(seed, messinessPercent) {
  * @param {HTMLElement} card
  * @returns {number}
  */
-function _cardRunPosition(card) {
-  return parseInt(card?.dataset?.runPosition, 10) || 0;
+function _cardScenePosition(card) {
+  return parseInt(card.dataset.runPosition, 10) || 0;
 }
 
 // ── Peek positioning (pure, unit-tested) ─────────────────────────────────────
 //
-// Two words this module uses throughout.
+// A scene is an unbroken stretch of steps sharing one object. A story that
+// leaves an object and returns to it has two scenes on that object, not one.
+// `scenePosition` is a card's 0-based place inside its own scene, so the first
+// card of every scene is 0 — including the first card of a second visit. It is
+// written on the card as `data-run-position`.
 //
-// A **run** is an unbroken stretch of steps sharing one object, which is the
-// same thing the module elsewhere calls a scene. A story that leaves an object
-// and returns to it has two runs on that object, not one. `runPosition` is a
-// card's 0-based place inside its own run, so the first card of every run is 0
-// — including the first card of a second visit.
-//
-// **Peek** is how far each later card in a run settles below the one before it,
+// Peek is how far each later card in a scene sits below the one before it,
 // leaving a strip of the earlier card visible above: the stack peeks out.
 // `peekHeight` is that distance in pixels, from `site.card_peek_height`, and it
 // defaults to 1, which is near enough to a flat stack that the effect only
 // appears on a site that raises it.
 
 /**
- * Compute the CSS `top` value (px) for a text card within an object run.
- * The first card in the run is vertically centred. Each subsequent
- * card settles peekHeightPx lower to create the peek stack effect.
+ * Compute the CSS `top` value (px) for a text card within its scene.
+ * The first card in the scene is vertically centred. Each subsequent
+ * card sits peekHeightPx lower to create the peek stack effect.
  *
  * @param {number} viewportH - Viewport height in px
  * @param {number} cardH - Card height in px
- * @param {number} runPosition - Position within this object's step sequence (0-based)
- * @param {number} peekHeightPx - Pixels each successive card settles lower
+ * @param {number} scenePosition - Position within the card's scene (0-based)
+ * @param {number} peekHeightPx - Pixels each successive card sits lower
  * @returns {number} Top offset in px
  */
-export function computeCardTop(viewportH, cardH, runPosition, peekHeightPx) {
+export function computeCardTop(viewportH, cardH, scenePosition, peekHeightPx) {
   const centred = (viewportH - cardH) / 2;
-  return centred + runPosition * peekHeightPx;
+  return centred + scenePosition * peekHeightPx;
 }
 
 // ── Accessibility helpers ─────────────────────────────────────────────────────
@@ -259,7 +262,7 @@ function _buildAriaLabel(objectId, stepAlt, PlateClass) {
   return PlateClass.ariaFallback;
 }
 
-// ── Module-level card pool state ──────────────────────────────────────────────
+// ── Module-level card stack state ──────────────────────────────────────────────
 
 // Lookup tables populated at initCardPool time and used during activateCard.
 // These are module-level so activateCard doesn't need to rebuild them each call.
@@ -272,15 +275,11 @@ let _zPlan = { viewerPlateZ: {}, textCardZ: {} };
 // info.json and append duplicate <link rel=prefetch> nodes to <head> unbounded.
 const _prefetchedScenes = new Set();
 
-// Extra writes a build adds to the settle, registered through onCardsSettle.
-// Module-level so a hook survives every settle rather than one.
-const _settleHooks = [];
-
 // ── Scene maps ────────────────────────────────────────────────────────────────
 
 /**
  * Build step-to-scene and scene-to-object lookup tables.
- * A "scene" is a contiguous run of steps sharing the same object.
+ * A scene is consecutive steps on the same object.
  * Called once at initCardPool() time; results stored on state for cross-module
  * access (scroll-engine.js, iiif-card.js can read state.stepToScene).
  *
@@ -337,10 +336,10 @@ function _plateForScene(sceneIndex) {
 }
 
 /**
- * Whether a step is a section card — a step with no object, and so no plate.
+ * Whether a step is a title card — a step with no object, and so no plate.
  *
  * A step outside the story answers false: the intro below the first step and
- * the void above the last one are not section cards, and the callers that ask
+ * the void above the last one are not title cards, and the callers that ask
  * about `stepIndex + 1` and `stepIndex + 2` run off the end of every story.
  *
  * @param {number} stepIndex
@@ -354,9 +353,9 @@ function _isTitleStep(stepIndex) {
 /**
  * The plate standing behind a step.
  *
- * A section card has no plate of its own, and the scene it interrupts is the
+ * A title card has no plate of its own, and the scene it interrupts is the
  * one whose plate the reader was last looking at. Walking back to the nearest
- * object scene is what lets a position on a section card say where that plate
+ * object scene is what lets a position on a title card say where that plate
  * belongs, which is the one plate nothing else names.
  *
  * @param {number} stepIndex
@@ -370,7 +369,7 @@ function _standingPlate(stepIndex) {
   return null;
 }
 
-// ── Card pool DOM management ──────────────────────────────────────────────────
+// ── Card stack DOM management ──────────────────────────────────────────────────
 
 /**
  * Build the transform string for a card's messiness offset.
@@ -397,12 +396,11 @@ function _liftBase(progress) {
   return progress ? `translateY(${-progress * 100}vh)` : 'translateY(0)';
 }
 
-// A viewport's worth of travel clears any card the fit model builds: the
-// card's top edge rests at (viewportH − cardH) / 2 and its lower edge at
-// (viewportH + cardH) / 2, and the ceiling holds cardH to 0.80 of the
-// viewport, so the lower edge rests at most 0.9 of the way down. The card's
-// own rotation and offset ride along, so a lifted card is the same sheet at a
-// different height rather than a squared-up one.
+// A viewport's worth of travel clears any side card: its
+// lower edge rests at most one padding above the viewport's bottom
+// (card-fit.js, sideCardTop). The card's own rotation and offset ride along,
+// so a lifted card is the same card at a different height rather than a
+// squared-up one.
 
 /**
  * How far along the lift the current scroll position stands.
@@ -410,7 +408,7 @@ function _liftBase(progress) {
  * The scroll engine writes the fraction of the way from one step to the next
  * into state on every frame, and the lift runs over exactly that interval:
  * the card being covered is clear of the top at the moment the card arriving
- * from below reaches its rest. Away from a scrub the value is whatever the
+ * from below reaches its rest. Away from scrubbing the value is whatever the
  * last frame left, which is why only the scrubbing paths read it.
  *
  * @returns {number} 0 at rest, 1 lifted clear
@@ -431,21 +429,20 @@ function _liftProgress() {
  * together, and the card stays exactly where it is. This is what makes the
  * stack read as plates covering one another.
  *
- * The step over it is a section card — the card's own plate lifts away
+ * The step over it is a title card — the card's own plate lifts away
  * through the top, and the card goes with it on the same clock.
  *
  * The step over it is in the same scene — no plate moves at all, so the card
  * travels alone. This is the case the lift exists for: once cards take the
  * height their content needs, a short card cannot cover a tall one.
  *
- * A section card has no plate of its own, so it never travels: whatever comes
+ * A title card has no plate of its own, so it never travels: whatever comes
  * over it covers it, full-viewport against full-viewport.
  *
  * @param {number} stepIndex - The card's step
  * @returns {boolean}
  */
 function _coveredCardLifts(stepIndex) {
-  if (!isFitHeight()) return false;
   const over = stepIndex + 1;
   if (stepIndex < 0 || over >= _stepsData.length) return false;
   if (getSceneIndex(stepIndex) === getSceneIndex(over)) return true;
@@ -467,7 +464,6 @@ function _coveredCardLifts(stepIndex) {
  * @param {string} base - A base translate from cardBaseFor
  */
 function placeCard(el, base) {
-  if (!el) return;
   const transform = buildTransform(_readCardMessiness(el), base);
   if (el.style.transform !== transform) el.style.transform = transform;
 }
@@ -485,12 +481,10 @@ function placeCard(el, base) {
  *
  * Every path that writes a card's position asks here: the settle each frame,
  * the reconciliation a jump runs, the backstop a backward move keeps, and the
- * two halves of an activation. That is what makes them agree. They used to
- * state the same four positions in their own terms, which is subtler than
- * plain duplication — two paths writing one position as two different strings
- * cannot recognise each other's work, so a redundant write could not be
- * skipped and a settle repeating a position restarted the transition that was
- * already carrying the card there.
+ * two halves of an activation. That is what makes them agree: two paths
+ * writing one position as two different strings cannot recognise each other's
+ * work, so a redundant write is not skipped and a settle repeating a position
+ * restarts the transition that is already carrying the card there.
  *
  * @param {number} cardIndex - The card being placed
  * @param {number} stepIndex - Step the position rests on; -1 is the intro
@@ -543,8 +537,8 @@ function _readCardMessiness(el) {
 // ── Geometry recompute on resize / layout change ─────────────────────────────
 
 /**
- * The side card's share of a tall viewport: its height under the fixed model,
- * and its ceiling under the fit model.
+ * The side card's share of a tall viewport: its ceiling, and the height of the
+ * portrait bottom card before the stylesheet's max-height caps it.
  */
 const SIDE_CARD_VIEWPORT_FRACTION = 0.80;
 
@@ -553,23 +547,26 @@ const SIDE_CARD_VIEWPORT_FRACTION = 0.80;
  *
  * The inline height has to go before the measurement, or `offsetHeight`
  * returns the inline figure rather than the content's. An inline `!important`
- * top is what beats the `top: auto !important` the landscape side-card rule
+ * top is what beats the `top: auto !important` the phone-height side-card rule
  * carries; a card whose top is driven by CSS instead does not come through
  * here.
  *
  * @param {HTMLElement} card
  * @param {number} viewportH - Current viewport height in px
- * @param {number} runPos - Position within this object's step sequence
- * @param {number} peekHeight - Pixels each successive card settles lower
- * @param {number|null} maxHeightPx - Ceiling in px, or null to leave the cap
- *   to the stylesheet
+ * @param {number} scenePos - Position within the card's scene
+ * @param {number} peekHeight - Pixels each successive card sits lower
+ * @param {{ band: number, pad: number, ceiling: number }|null} [bandGeo] - The
+ *   band under the top controls, for a phone-height side card: the card is
+ *   held under its ceiling and placed below the band
  */
-function _sizeCardToContent(card, viewportH, runPos, peekHeight, maxHeightPx) {
+function _sizeCardToContent(card, viewportH, scenePos, peekHeight, bandGeo = null) {
   card.style.height = '';
-  if (maxHeightPx == null) card.style.removeProperty('max-height');
-  else card.style.maxHeight = `${maxHeightPx}px`;
+  if (bandGeo) card.style.maxHeight = `${bandGeo.ceiling}px`;
+  else card.style.removeProperty('max-height');
   const cardH = card.offsetHeight;
-  const topPx = computeCardTop(viewportH, cardH, runPos, peekHeight);
+  const topPx = bandGeo
+    ? sideCardTop({ H: viewportH, cardH, scenePos, peek: peekHeight, band: bandGeo.band, pad: bandGeo.pad })
+    : computeCardTop(viewportH, cardH, scenePos, peekHeight);
   card.style.setProperty('top', `${topPx}px`, 'important');
 }
 
@@ -578,72 +575,91 @@ function _sizeCardToContent(card, viewportH, runPos, peekHeight, maxHeightPx) {
  *
  * Called by onViewportResize and onLayoutChange subscriptions so card geometry
  * stays correct after desktop window resize, device rotation, or layout-mode
- * flip. Iterates `.text-card` DOM nodes (iterating the DOM is the reliable
- * source of all active cards regardless of state.textCards population order).
- * Applies computeCardTop with runPosition=0 for all cards and uses
- * style.setProperty('top', ..., 'important') so the inline value wins the
- * cascade over the `top: auto !important` in the landscape side-card rule.
+ * flip, and by the content watch. Iterates `.text-card` DOM nodes (the DOM
+ * is the reliable source of all cards regardless of state.textCards
+ * population order). Tops are written with style.setProperty('top', ...,
+ * 'important') so the inline value wins over the phone-height side-card rule's.
  *
  * @param {number} viewportW - Current viewport width in px
  * @param {number} viewportH - Current viewport height in px
+ * @param {HTMLElement[]|null} [changed] - The cards to fit; every card if null
  */
-function _recomputeCardGeometry(viewportW, viewportH) {
+function _recomputeCardGeometry(viewportW, viewportH, changed = null) {
+  timeGeometryPass(() => _geometryPass(viewportW, viewportH, changed));
+}
+
+function _geometryPass(viewportW, viewportH, changed) {
   const peekHeight = _config.peekHeight;
-  const landscapeSideCard = isLandscapeSideCard();
-  // The fit model governs the desktop side card and nothing else: a window no
-  // taller than the side-card threshold (a landscape phone, or a short desktop
-  // window) already sizes its side card to content through the stylesheet, and
-  // the portrait bottom card keeps its own geometry.
-  const fitSideCard = isFitHeight()
-    && !landscapeSideCard
-    && getLayoutMode() !== 'vertical';
+  const phoneHeightSideCard = isPhoneHeightSideCard();
+  // The side card on a horizontal layout is sized by its content
+  // (card-fit.js). A phone-height window and the portrait
+  // bottom card are on a vertical layout and keep their own geometry below.
+  const horizontal = getLayoutMode() !== 'vertical';
+  publishSideCardWidth(viewportW, viewportH, horizontal);
 
   const cards = document.querySelectorAll('.text-card');
-  for (const card of cards) {
-    const runPos = parseInt(card.dataset.runPosition, 10) || 0;
+  const side = horizontal ? fitSideCards(changed || cards, { W: viewportW, H: viewportH,
+    peek: peekHeight, fraction: SIDE_CARD_VIEWPORT_FRACTION, activeIndex: state.currentIndex }) : null;
 
-    if (landscapeSideCard) {
-      // A window no taller than the side-card threshold, at any width: the CSS
-      // rule sets `height: auto !important` and the ceiling, so the card is
-      // sized to its content. Clear any stale inline height, measure the real
-      // rendered height, and centre by that — the portrait `viewportH * 0.80`
-      // model oversizes the card and jams it against the top on a short landscape
-      // viewport. Inline !important top beats the
-      // landscape rule's `top: auto !important`.
-      _sizeCardToContent(card, viewportH, runPos, peekHeight, null);
-    } else if (getLayoutMode() === 'vertical') {
-      // getLayoutMode() reads the live matchMedia (self-initialising), so this is
-      // correct even at the init-time call below — before layout-mode.js has
-      // written state.layoutMode (which defaults to 'horizontal' and would wrongly
-      // pick the desktop branch, jamming the portrait card at the top).
-      // Portrait mobile: the card is bottom-anchored by CSS (`top: auto !important`,
-      // `max-height: 40vh`). Remove any inline top so the CSS anchor wins — do NOT
-      // force an !important top here, or the card detaches from the bottom on resize.
-      card.style.removeProperty('top');
-      card.style.removeProperty('max-height');
-      card.style.height = `${viewportH * SIDE_CARD_VIEWPORT_FRACTION}px`;  // capped by the CSS max-height: 40vh
-    } else if (fitSideCard) {
-      // Desktop horizontal under the fit model: the viewport fraction is a
-      // ceiling rather than a height, and the card takes what its content
-      // needs below it. At the ceiling the card's own `overflow: hidden` and
-      // `margin-block: auto` do the clipping, exactly as at the fixed height.
-      _sizeCardToContent(card, viewportH, runPos, peekHeight,
-        viewportH * SIDE_CARD_VIEWPORT_FRACTION);
-    } else {
-      // Desktop horizontal: tall side card sized to 80% of the (tall) viewport,
-      // vertically centred. No base CSS `top`, so the inline value drives placement.
-      const cardH = viewportH * SIDE_CARD_VIEWPORT_FRACTION;
-      const topPx = computeCardTop(viewportH, cardH, runPos, peekHeight);
-      card.style.setProperty('top', `${topPx}px`, 'important');
-      card.style.height = `${cardH}px`;
+  const phoneBand = _phoneBandFor(phoneHeightSideCard, viewportW, viewportH);
+
+  if (!horizontal) {
+    for (const card of cards) {
+      _fitCardByLayout(card, viewportH, peekHeight, phoneHeightSideCard, phoneBand);
     }
   }
 
   // A media scene's cards can go below its player only where they were just
   // sized to their content on a horizontal layout: the arrangement is decided
   // from those heights.
-  const contentSized = (fitSideCard || landscapeSideCard) && getLayoutMode() !== 'vertical';
-  _arrangeMediaScenes(cards, viewportW, viewportH, contentSized);
+  _arrangeMediaScenes(cards, viewportW, viewportH, horizontal, side);
+}
+
+/**
+ * The band a phone-height side card clears the top controls by, or null. A
+ * short portrait window is not a phone held sideways and keeps the card the
+ * CSS rule gives it.
+ *
+ * @param {boolean} eligible - The window is phone height
+ * @param {number} viewportW - Current viewport width in px
+ * @param {number} viewportH - Current viewport height in px
+ * @returns {{ band: number, pad: number, ceiling: number }|null}
+ */
+function _phoneBandFor(eligible, viewportW, viewportH) {
+  return eligible && getLayoutMode() === 'vertical' && viewportW > viewportH
+    ? sideCardBand({ W: viewportW, H: viewportH, fraction: SIDE_CARD_VIEWPORT_FRACTION })
+    : null;
+}
+
+/**
+ * Size and place one text card on a vertical layout: sized to its content
+ * for a phone-height side card, bottom-anchored by CSS on a portrait layout. The
+ * side card on a horizontal layout is placed by card-fit.js.
+ *
+ * @param {HTMLElement} card
+ * @param {number} viewportH - Current viewport height in px
+ * @param {number} peekHeight - Pixels each successive card sits lower
+ * @param {boolean} phoneHeightSideCard - The CSS rule sets the card's height to auto
+ * @param {{ band: number, pad: number, ceiling: number }|null} phoneBand
+ */
+function _fitCardByLayout(card, viewportH, peekHeight, phoneHeightSideCard, phoneBand) {
+  const scenePos = parseInt(card.dataset.runPosition, 10) || 0;
+
+  if (phoneHeightSideCard) {
+    // A phone-height window (a phone on its side, a short desktop window or a
+    // short portrait window): the CSS rule sets
+    // `height: auto !important` and the ceiling, so the card is sized to its
+    // content and centred by the height it renders at. A phone's ceiling and
+    // top come from the band under the top controls.
+    _sizeCardToContent(card, viewportH, scenePos, peekHeight, phoneBand);
+  } else {
+    // Portrait phone: the card is bottom-anchored by CSS (`top: auto !important`,
+    // `max-height: 40vh`). Remove any inline top so the CSS anchor wins — do not
+    // force an !important top here, or the card detaches from the bottom on resize.
+    card.style.removeProperty('top');
+    card.style.removeProperty('max-height');
+    card.style.height = `${viewportH * SIDE_CARD_VIEWPORT_FRACTION}px`;  // capped by the CSS max-height: 40vh
+  }
 }
 
 /**
@@ -658,19 +674,21 @@ function _recomputeCardGeometry(viewportW, viewportH) {
  * @param {number} viewportH - Current viewport height in px
  * @param {boolean} contentSized - Whether the cards were sized to their content
  *   on a horizontal layout
+ * @param {{ topOf: (card: HTMLElement) => number }|null} side - The fit's placement;
+ *   null on a vertical layout, where no scene is arranged
  */
-function _arrangeMediaScenes(cards, viewportW, viewportH, contentSized) {
+function _arrangeMediaScenes(cards, viewportW, viewportH, contentSized, side) {
   const cardsByScene = {};
   for (const card of cards) {
     const scene = getSceneIndex(parseInt(card.dataset.stepIndex, 10));
     (cardsByScene[scene] ||= []).push(card);
   }
-  const besideTop = (card) => computeCardTop(
-    viewportH, card.offsetHeight, _cardRunPosition(card), _config.peekHeight);
+  const besideTop = side?.topOf;
+  const topBand = measureTopBand(viewportW, viewportH);
   for (const [scene, plate] of Object.entries(state.viewerPlates)) {
     if (!(plate instanceof MediaPlate)) continue;
     arrangeMediaScene(plate.container, cardsByScene[scene] || [], {
-      W: viewportW, H: viewportH, eligible: contentSized, besideTop,
+      W: viewportW, H: viewportH, eligible: contentSized, besideTop, topBand,
     });
     plate.resize();
   }
@@ -725,7 +743,7 @@ function _plateClassFor(cardType) {
  * Give a plate that holds a player the clip window it opens on.
  *
  * Players are one per scene, so the window written here is the scene's first
- * step's; later steps in the same run re-clip the running player instead of
+ * step's; later steps in the same scene re-clip the running player instead of
  * rebuilding it. A plate of any other card type is left alone.
  *
  * @param {HTMLElement} plate
@@ -743,8 +761,8 @@ function _markMediaPlate(plate, cardType, firstStep) {
 /**
  * One viewer plate per scene, not per step.
  *
- * A scene is an unbroken run of steps on one object: they share a plate, so
- * scrolling within a run never rebuilds the viewer underneath the reader.
+ * A scene is consecutive steps on one object: they share a plate, so
+ * scrolling within a scene never rebuilds the viewer underneath the reader.
  */
 function _createViewerPlates(steps, cardStack, audioObjects) {
   // Create viewer plates (one per scene)
@@ -790,19 +808,18 @@ function _createViewerPlates(steps, cardStack, audioObjects) {
 /**
  * One text card per step, stacked with a peek of the card beneath.
  *
- * Each card also records where it sits in its object's run, which is what
- * lets activateCard tell a move within one object from a move between two.
+ * Each card also records where it sits in its scene, which is what lets
+ * activateCard tell a move within one scene from a move between two.
  */
 function _createTextCards(steps, cardStack, audioObjects, messinessPercent) {
-  // Create text cards (one per step) and track each card's place in its run.
+  // Create text cards (one per step) and track each card's place in its scene.
   //
-  // A run is the stretch of consecutive steps sharing one object, which is what
-  // a scene is, so the counter is keyed by scene rather than by object: a story
-  // that returns to an object later starts a fresh run there, and
-  // computeCardTop centres the first card of every run. Keying by object would
-  // carry the count across the gap and settle that card peekHeight lower for
-  // each earlier appearance.
-  const sceneRunPosition = {};  // scene index → next run position
+  // The counter is keyed by scene rather than by object: a story that returns
+  // to an object later starts a fresh scene there, and computeCardTop centres
+  // the first card of every scene. Keying by object would carry the count
+  // across the gap and put that card peekHeight lower for each earlier
+  // appearance.
+  const nextScenePosition = {};  // scene index → next position in the scene
 
   for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
     const step = steps[stepIdx];
@@ -825,11 +842,11 @@ function _createTextCards(steps, cardStack, audioObjects, messinessPercent) {
 
     const objectIndex = getSceneIndex(stepIdx);
 
-    if (!Object.hasOwn(sceneRunPosition, objectIndex)) {
-      sceneRunPosition[objectIndex] = 0;
+    if (!Object.hasOwn(nextScenePosition, objectIndex)) {
+      nextScenePosition[objectIndex] = 0;
     }
-    const runPos = sceneRunPosition[objectIndex];
-    sceneRunPosition[objectIndex]++;
+    const scenePos = nextScenePosition[objectIndex];
+    nextScenePosition[objectIndex]++;
     const zIndex = _zPlan.textCardZ[stepIdx];
     const messiness = getCardMessiness(stepIdx, messinessPercent);
 
@@ -837,7 +854,7 @@ function _createTextCards(steps, cardStack, audioObjects, messinessPercent) {
     card.className = 'text-card';
     card.dataset.stepIndex = stepIdx;
     card.dataset.object = objectId;
-    card.dataset.runPosition = runPos;
+    card.dataset.runPosition = scenePos;
     card.style.zIndex = zIndex;
     card.style.transform = buildTransform(messiness, 'translateY(100vh)');
     card.dataset.messinessRot = messiness.rot;
@@ -845,11 +862,11 @@ function _createTextCards(steps, cardStack, audioObjects, messinessPercent) {
     card.dataset.messinessOffY = messiness.offY;
 
     // `.step-data` is a hidden block the story layout renders every step into
-    // at build time, with markdownify, panel triggers and layer conditions
-    // already applied. Cloning out of it is what lets a card carry authored
-    // markup the client cannot produce: Liquid has run, and the browser has no
-    // markdown renderer. A step with no node there falls back to building the
-    // content from the step data, which loses that processing.
+    // at build time, with panel triggers and layer conditions already
+    // applied. Cloning out of it is what lets a card carry markup only Liquid
+    // produces. A step with no node there falls back to building the content
+    // from the step data, which carries the rendered answer but not that
+    // markup.
     const hiddenStep = document.querySelector(`.step-data .story-step[data-step="${step.step}"]`);
     if (hiddenStep) {
       const content = hiddenStep.querySelector('.step-content');
@@ -906,12 +923,20 @@ function _preloadFirstScenePlate(steps) {
   _evictBeyondPoolCap(0);
 }
 
+/** Removes the last init's resize, layout and content subscriptions. */
+let _stopGeometryWatch = null;
+
+function _teardownGeometryWatch() {
+  _stopGeometryWatch?.();
+  _stopGeometryWatch = null;
+}
+
 /**
- * Initialize the card pool: create all DOM elements, apply initial transforms
+ * Initialize the card stack: create all DOM elements, apply initial transforms
  * (off-screen below), and append them to .card-stack.
  *
- * Builds the unique objects list from stepsData to assign z-index bands.
- * Tracks run position per object for peek-stacking calculations.
+ * Assigns each scene its z-range from stepsData, and records each card's
+ * position in its scene for peek-stacking calculations.
  *
  * @param {Object} storyData - window.storyData
  * @param {Object} storyData.steps - Array of step data objects
@@ -920,6 +945,11 @@ function _preloadFirstScenePlate(steps) {
 export function initCardPool(storyData, config) {
   const cardStack = document.querySelector('.card-stack');
   if (!cardStack) return;
+
+  // Each call installs its own subscriptions and content watch; the previous
+  // call's are removed first so a second init leaves one geometry pass per
+  // trigger.
+  _teardownGeometryWatch();
 
   const steps = (storyData?.steps || []).filter(s => !s._metadata);
 
@@ -933,7 +963,7 @@ export function initCardPool(storyData, config) {
   _config = _resolveCardConfig(config);
 
   // Compute scene-based z-indexes — each object change starts a new scene
-  // with its own z-index band, even if the object was seen before.
+  // with its own z-range, even if the object was seen before.
   _zPlan = computeZIndexPlan(steps);
 
   // Build scene maps (walk steps, identify scene boundaries)
@@ -954,39 +984,33 @@ export function initCardPool(storyData, config) {
 
   _preloadFirstScenePlate(steps);
 
-  // Subscribe to layout-mode events so card geometry stays live
-  // (no new ad-hoc resize listeners — only layout-mode.js subscriptions).
-  // Mirror the video-card.js subscription pattern.
-  onViewportResize(({ viewport }) => {
+  // Layout-mode events keep card geometry live; the content watch below
+  // observes each card's content, never the viewport.
+  // The resize pass is the one writer of the active card's rect and the one
+  // caller of the re-snap on this path: the card is measured after its own
+  // geometry is written, then the viewer is framed against that rect.
+  const stopResize = onViewportResize(({ viewport }) => {
     _recomputeCardGeometry(viewport.w, viewport.h);
+    const activeCard = document.querySelector('.text-card.is-active');
+    state.cardOverlayRect = activeCard ? activeCard.getBoundingClientRect() : null;
+    reSnapActiveViewer();
   });
-  onLayoutChange(({ viewport }) => {
+  const stopLayout = onLayoutChange(({ viewport }) => {
     _recomputeCardGeometry(viewport.w, viewport.h);
   });
 
   // Apply correct geometry once now so a fresh load gets the right placement —
-  // in particular a direct landscape deep link, where no resize/layout event
-  // fires to trigger the side-card centring. Cards are
+  // in particular a direct deep link into a phone-height window, where no
+  // resize/layout event fires to trigger the side-card centring. Cards are
   // built with content above, so offsetHeight is measurable.
   _recomputeCardGeometry(window.innerWidth, window.innerHeight);
 
-  // A card sized to its content is centred by a height read at init time,
-  // and at init time the web fonts may still be loading: the content is laid
-  // out in the fallback face, measures taller, and the card settles that much
-  // below the centre of the viewport, with nothing but a resize to correct it.
-  // The measurement the centring uses has to be the one the reader sees, so
-  // the geometry is taken again once the fonts are in. Unconditionally: the
-  // desktop side card is one card sized to its content and the landscape-phone
-  // side card is another, and which of them a page has is not settled at init
-  // time — a rotation between the two is a layout change away.
-  if (document.fonts?.ready) {
-    document.fonts.ready.then(() => {
-      _recomputeCardGeometry(window.innerWidth, window.innerHeight);
-    });
-  }
+  const stopWatch = watchCardContent(Object.values(state.textCards), (changed) => {
+    _recomputeCardGeometry(window.innerWidth, window.innerHeight, changed);
+  });
+  _stopGeometryWatch = () => { stopResize(); stopLayout(); stopWatch(); };
 
-
-  applyCardMotionDuration(cardStack);
+  setMoveSeconds(moveSeconds(0), cardStack);
 }
 
 /**
@@ -997,8 +1021,9 @@ export function initCardPool(storyData, config) {
  * Must stay selector-compatible with the server-rendered step markup that
  * downstream code keys on: .step-question, .step-answer, and
  * .panel-trigger[data-panel][data-step] (panels.js delegates on [data-panel]).
- * Intentional divergences from the server markup: content renders as escaped
- * flat text (no markdown), headings use div not h2, no viewer-warning block,
+ * The question is escaped text and the answer is the HTML the build rendered,
+ * as in the server markup. Intentional divergences from it: headings use div
+ * not h2, no viewer-warning block,
  * and layer triggers render only when layer*_button is non-empty (the server
  * falls back to a default label whenever layer content exists).
  *
@@ -1007,7 +1032,7 @@ export function initCardPool(storyData, config) {
  */
 function buildTextCardContent(step) {
   const question = escapeHtml(step.question || '');
-  const answer   = escapeHtml(step.answer   || '');
+  const answer   = step.answer || '';
 
   const hasLayer1 = step.layer1_button && step.layer1_button.trim();
   const hasLayer2 = step.layer2_button && step.layer2_button.trim();
@@ -1022,7 +1047,7 @@ function buildTextCardContent(step) {
 
   return `
     <div class="step-question">${question}</div>
-    <div class="step-answer">${answer}</div>
+    <div class="step-answer${step.answer_long ? ' step-answer--long' : ''}">${answer}</div>
     ${layerButtons ? `<div class="step-actions">${layerButtons}</div>` : ''}
   `;
 }
@@ -1030,22 +1055,21 @@ function buildTextCardContent(step) {
 /**
  * Build the inner HTML for a title card from step data.
  *
- * question/answer carry author CSV text whose documented contract is plain
- * text only, so both are escaped, matching buildTextCardContent. Escaping
- * here is display consistency, not an injection boundary — the same strings
- * flow unescaped through the Liquid intro TOC and the server-rendered step
- * pool.
+ * The question is author CSV text, escaped as plain text; the answer is the
+ * HTML the build rendered, inserted as the server-rendered step prints it,
+ * matching buildTextCardContent. The answer's paragraphs sit in a div, since
+ * a paragraph cannot hold one.
  *
  * @param {Object} step - Step data object
  * @returns {string} HTML string
  */
 function _buildTitleCardContent(step) {
   const heading = escapeHtml(step.question || '');
-  const body    = escapeHtml(step.answer   || '');
+  const body    = step.answer || '';
   return `
     <div class="title-card-inner">
       <h2 class="title-card-heading">${heading}</h2>
-      ${body ? '<p class="title-card-body">' + body + '</p>' : ''}
+      ${body ? '<div class="title-card-body">' + body + '</div>' : ''}
     </div>
   `;
 }
@@ -1113,7 +1137,7 @@ function _clearActiveTitleCard(direction) {
  * `is-stacked` — hold it at translateY(0), so one left behind hides the
  * intro completely. The card at index 0 is the case the intro restore has
  * no other handle on: `state.textCards[0]` is undefined on a story whose
- * first step is a section.
+ * first step is a title card.
  */
 export function releaseTitleCardsForIntro() {
   _clearActiveTitleCard('backward');
@@ -1218,7 +1242,7 @@ export function reconcilePlatesForJump(targetIndex) {
   const targetScene = state.stepToScene[targetIndex];
   const moved = [];
 
-  for (const [sceneIndex, plate] of Object.entries(state.viewerPlates || {})) {
+  for (const [sceneIndex, plate] of Object.entries(state.viewerPlates)) {
     if (!plate || Number(sceneIndex) === targetScene) continue;
 
     const el = plate.container;
@@ -1250,7 +1274,6 @@ export function reconcilePlatesForJump(targetIndex) {
  * @param {HTMLElement} cardEl - The card the move is activating
  */
 function _restoreBackwardTarget(cardEl) {
-  if (!cardEl) return;
   if (cardEl.classList.contains('is-stacked') ||
       cardEl.classList.contains('is-active')) return;
 
@@ -1272,8 +1295,8 @@ function _activateForward(index, direction, card, step, objectId,
     // Full card — new viewer plate + new text card
     _activateNewViewerPlate(objectId, index, prevObjectId, step, direction);
 
-    // Reset the object run tracker
-    state.currentObjectRun = { objectId, runPosition: _cardRunPosition(card) };
+    // Restart the scene tracker
+    state.currentObjectScene = { objectId, scenePosition: _cardScenePosition(card) };
 
     // Deactivate previous text card (keep stacked, not slide away)
     _deactivatePreviousTextCard(index, direction);
@@ -1288,7 +1311,7 @@ function _activateForward(index, direction, card, step, objectId,
 
   } else {
     // Text-only on same object
-    state.currentObjectRun.runPosition = _cardRunPosition(card);
+    state.currentObjectScene.scenePosition = _cardScenePosition(card);
 
     // Deactivate previous text card (becomes stacked)
     _deactivatePreviousTextCard(index, direction);
@@ -1370,7 +1393,7 @@ function _activateBackward(index, direction, card, step, objectId,
 
     _swapPlatesBackward(currentPlate, prevPlate, index);
 
-    state.currentObjectRun = { objectId, runPosition: _cardRunPosition(card) };
+    state.currentObjectScene = { objectId, scenePosition: _cardScenePosition(card) };
 
     // Slide current text card back down
     _deactivatePreviousTextCard(index, direction);
@@ -1385,7 +1408,7 @@ function _activateBackward(index, direction, card, step, objectId,
 
   } else {
     // Same object, backward: text card slides down, previous card reactivated
-    state.currentObjectRun.runPosition = _cardRunPosition(card);
+    state.currentObjectScene.scenePosition = _cardScenePosition(card);
 
     _deactivatePreviousTextCard(index, direction);
     _activateTextCard(card);
@@ -1469,7 +1492,7 @@ export function activateCard(index, direction) {
   const prevStep = index > 0 ? _stepsData[index - 1] : null;
 
   const objectId = card.dataset.object;
-  const prevObjectId = state.currentObjectRun.objectId;
+  const prevObjectId = state.currentObjectScene.objectId;
 
   const needsNewViewer = _needsNewViewer(step, prevStep, objectId, prevObjectId);
 
@@ -1499,14 +1522,14 @@ export function activateCard(index, direction) {
  * The cards have one statement of where they belong for a position; the
  * plates need the same and for the same reason. A plate moves only across a
  * scene boundary, so nothing restates it for a position that does not cross
- * one, and a scrub that stops short leaves it wherever the last frame put it.
- * The plate behind a section card is the case with no writer at all: resting
- * on the section card, the pair in play is the section and the object after
- * it, which moves the arriving plate, while the plate the section card is
- * covering belongs clear of the top and is never named.
+ * one, and a reader's scroll that stops short leaves it wherever the last
+ * frame put it. The plate behind a title card is the case with no writer at
+ * all: resting on the title card, the pair in play is the title card and the
+ * object after it, which moves the arriving plate, while the plate the title
+ * card is covering belongs clear of the top and is never named.
  *
  * Three plates are in play. The standing plate — the one behind the step the
- * position rests on — is clear of the top while a section card holds the
+ * position rests on — is clear of the top while a title card holds the
  * screen, on its way there while the position crosses into one, and at rest
  * otherwise. The next scene's plate is the position's own fraction of a
  * viewport up from below. The one after that is a full viewport down, which a
@@ -1555,9 +1578,9 @@ function _settlePlates(stepIndex, progress) {
  */
 export function setCardProgress(stepIndex, progress) {
   // A whole step is a resting place, and the cards belong on it whoever brought
-  // them there: the write has to happen off the scrub too, or a scroll that
-  // carries on after the scrub flag has lapsed leaves the arriving card
-  // wherever the last scrub frame put it.
+  // them there: the write has to happen when the reader is not scrubbing too, or
+  // a scroll that carries on after `is-scrubbing` has lapsed leaves the arriving
+  // card wherever the last scrubbing frame put it.
   const cardStack = document.querySelector('.card-stack');
   const scrubbing = !!cardStack && cardStack.classList.contains('is-scrubbing');
   if (!scrubbing && progress >= 0.001) return;
@@ -1569,7 +1592,7 @@ export function setCardProgress(stepIndex, progress) {
  * Put every card the scroll moves where this position says it belongs.
  *
  * One idea of settling, for every path that has to state where the cards are:
- * the scrub frame, the snap that knows its landing before it gets there, the
+ * the scrubbing frame, the snap that knows its landing before it gets there, the
  * scroll that stops of its own accord, the keyboard move that has a target. The
  * position is the scroll engine's — 0 is the intro, 1 is step 0 — and the cards
  * follow from it. Three cards are in play at any position: the step it rests
@@ -1578,7 +1601,7 @@ export function setCardProgress(stepIndex, progress) {
  * a full viewport down, which is the card the position has just stopped moving
  * and which a crossing would otherwise leave a pixel or two short of home. On a
  * whole step that is the resting invariant, and on a position between steps it
- * is the same interpolation a scrub frame writes, so a scroll that stops short
+ * is the same interpolation a scrubbing frame writes, so a scroll that stops short
  * leaves the cards agreeing with it.
  *
  * Below position 1 the same three are the intro's: no step underneath, the
@@ -1589,9 +1612,10 @@ export function setCardProgress(stepIndex, progress) {
  * where every plate in play stands, not only the one the step it is leaving
  * happens to move.
  *
- * The transition is left alone, so off the scrub the write is a slide from
- * wherever the card is and under `is-scrubbing` it is a position. That is what
- * makes a settle safe to run from the scrub and from the animation both.
+ * The transition is left alone, so when the reader is not scrubbing the write
+ * is a slide from wherever the card is and under `is-scrubbing` it is a
+ * position. That is what makes a settle safe to run from scrubbing and from the
+ * animation both.
  *
  * A settle states where a thing belongs, and where it already says that it
  * says nothing: a transform written over a transition that is running towards
@@ -1612,34 +1636,12 @@ export function settleCards(position) {
   // place the card was left. Card 0 up to the one waiting below is the whole
   // stack, and placing a card that is already where it belongs writes nothing.
   for (let i = 0; i <= stepIndex + 2; i++) {
-    const el = i < 0 ? null : state.textCards?.[i] || state.titleCards?.[i];
+    const el = state.textCards[i] || state.titleCards[i];
     if (!el) continue;
     placeCard(el, cardBaseFor(i, stepIndex, progress));
   }
 
   _settlePlates(stepIndex, progress);
-
-  for (const hook of _settleHooks) hook(stepIndex, progress);
-}
-
-/**
- * Add a settle of your own to the one the engine runs.
- *
- * The base stack moves two cards per position and leaves the rest where they
- * are. A build that moves more of them — cards of their own height, which lift
- * the stack under the active one by the same scrub progress — registers the
- * writes for those here rather than repeating the settle, so every path that
- * settles the stack settles all of it.
- *
- * @param {(stepIndex: number, progress: number) => void} hook
- * @returns {() => void} Removes the hook
- */
-export function onCardsSettle(hook) {
-  _settleHooks.push(hook);
-  return () => {
-    const at = _settleHooks.indexOf(hook);
-    if (at >= 0) _settleHooks.splice(at, 1);
-  };
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -1647,7 +1649,7 @@ export function onCardsSettle(hook) {
 /**
  * Hand a plate the step it has arrived on.
  *
- * The pool has already moved the element; what the plate does inside it —
+ * The card stack has already moved the element; what the plate does inside it —
  * build a player, start it, frame a viewer, or nothing because it is already
  * where it should be — is the plate's own business.
  *
@@ -1666,7 +1668,7 @@ function _wireViewerForPlate(newPlate, sceneIndex, step) {
 /**
  * Bring a plate on screen, and move the one it replaces out of the way.
  *
- * Forward, the arriving plate starts below the fold and rises. Scene 0 is
+ * Forward, the arriving plate starts off screen below and rises. Scene 0 is
  * the exception: the intro zone may already have positioned it part-way, and
  * resetting it there would make it jump, so it is reset only when it is
  * still where it was built. Backward, the arriving plate is simply in place
@@ -1740,16 +1742,15 @@ function _activateNewViewerPlate(objectId, stepIndex, prevObjectId, step, direct
   // Update plate z-index from the scene plan.
   newPlate.container.style.zIndex = _zPlan.plateZ[stepIndex];
 
-  // Intra-scene mode change: a full-object↔detail flip within one object's run
+  // Intra-scene mode change: a full-object↔detail flip within one scene
   // flags needsNewViewer, but the scene — and therefore the plate element — is
   // unchanged, so prevPlate and newPlate resolve to the same node. The plate is
   // already on-screen: keep it visible and skip the slide/deactivate pair, which
   // would otherwise add then immediately strip is-active (add below, remove in
-  // the prevPlate block) and blank the viewer. This surfaces on TOC/deep-link
-  // jumps and on ordinary forward scroll across a zoom-in→out step on the same
-  // object. The wiring below still runs: the plate may hold no viewer yet (a
-  // story whose first step is a section card wires none at load), and the step's
-  // framing has to reach the viewer whether or not the plate moves.
+  // the prevPlate block) and blank the viewer. The wiring below still runs: the
+  // plate may hold no viewer yet (a story whose first step is a title card
+  // wires none at load), and the step's framing has to reach the viewer whether
+  // or not the plate moves.
   const samePlate = prevPlate && prevPlate === newPlate;
 
   if (samePlate) {
@@ -1772,8 +1773,8 @@ function _activateNewViewerPlate(objectId, stepIndex, prevObjectId, step, direct
  * plate itself is permanent and stays where it is; only the viewer inside it
  * goes, and re-entering the scene builds another.
  *
- * Counted over the plates rather than over a list of viewers, because the
- * plate holding a viewer and the viewer are now one thing.
+ * Counted over the plates rather than over a list of viewers: the plate holds
+ * its viewer, so the plate and the viewer are one thing.
  *
  * @param {number} currentScene - Scene the newest viewer belongs to
  */
@@ -1800,7 +1801,7 @@ function _evictBeyondPoolCap(currentScene) {
 /**
  * Deactivate the currently active text card (the one with is-active).
  *
- * @param {number} newIndex - The step index we are moving TO (skip it)
+ * @param {number} newIndex - The step index being moved to (skipped)
  * @param {'forward'|'backward'} direction
  */
 function _deactivatePreviousTextCard(newIndex, direction) {
@@ -1852,13 +1853,15 @@ function _writeCardOverlayRect(cardEl) {
  */
 function _activateTextCard(cardEl) {
   const messiness = _readCardMessiness(cardEl);
+  // A card scrolled inside the vertical layout arrives at its question.
+  if (cardEl.scrollTop !== 0) cardEl.scrollTop = 0;
   cardEl.classList.remove('is-stacked');
   cardEl.classList.add('is-active');
 
   const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const isScrubbing    = document.querySelector('.card-stack')?.classList.contains('is-scrubbing');
 
-  // Mid-scrub the lift belongs to the scroll position, not to this write: a
+  // While scrubbing the lift belongs to the scroll position, not to this write: a
   // card uncovered at the boundary is one frame's worth of travel away from
   // rest, and the next frame's setCardProgress carries it the rest of the
   // way. Resting it here instead would put it home for a frame and then lift
@@ -1867,7 +1870,7 @@ function _activateTextCard(cardEl) {
   cardEl.style.transform = buildTransform(
     messiness, cardBaseFor(idx, idx, isScrubbing ? _liftProgress() : 0));
 
-  // Write final rect to state.cardOverlayRect once the slide-up transition settles.
+  // Write final rect to state.cardOverlayRect once the slide-up transition ends.
   // Two cases skip transitionend (it never fires when transition: none is set):
   //   1. prefers-reduced-motion: reduce  (_sass/_responsive.scss:110-126)
   //   2. .card-stack.is-scrubbing        (_sass/_story.scss:50-52)
@@ -1877,19 +1880,21 @@ function _activateTextCard(cardEl) {
     _writeCardOverlayRect(cardEl);
     return;
   }
-  // Ensure at most one pending settle listener per card: rapid re-activation
+  // Ensure at most one pending transition-end listener per card: rapid re-activation
   // would otherwise stack multiple live closures until each transition ends.
-  if (cardEl._settleHandler) {
-    cardEl.removeEventListener('transitionend', cardEl._settleHandler);
+  if (cardEl._transitionEndHandler) {
+    cardEl.removeEventListener('transitionend', cardEl._transitionEndHandler);
   }
-  const onSettled = (ev) => {
+  const onTransitionEnd = (ev) => {
     if (ev.target !== cardEl || ev.propertyName !== 'transform') return;
-    cardEl.removeEventListener('transitionend', onSettled);
-    cardEl._settleHandler = null;
-    _writeCardOverlayRect(cardEl);
+    cardEl.removeEventListener('transitionend', onTransitionEnd);
+    cardEl._transitionEndHandler = null;
+    // A card that has left since is not the one the region is uncovered
+    // around, and the camera reads this rect on every frame.
+    if (cardEl.classList.contains('is-active')) _writeCardOverlayRect(cardEl);
   };
-  cardEl._settleHandler = onSettled;
-  cardEl.addEventListener('transitionend', onSettled);
+  cardEl._transitionEndHandler = onTransitionEnd;
+  cardEl.addEventListener('transitionend', onTransitionEnd);
 }
 
 /**
@@ -1969,7 +1974,7 @@ function _activateTitleCardStep(index, direction) {
   titleCard.style.transform = 'translateY(0)';
 
   state.activeTitleCardIndex = index;
-  state.currentObjectRun = { objectId: '', runPosition: 0 };
+  state.currentObjectScene = { objectId: '', scenePosition: 0 };
 
   // No text card active on a title step.
   state.cardOverlayRect = null;
@@ -1988,11 +1993,7 @@ function _activateTitleCardStep(index, direction) {
  *
  * A plate holding a player is asked to load and answers for itself whether
  * there is anything to do. An IIIF plate is not idempotent, so it is skipped
- * when a viewer card already exists for the scene, and its tiles are fetched
- * alongside.
- *
- * This was written out twice, once for the scenes ahead and once for those
- * behind, in bodies that had not diverged.
+ * when the plate already holds a viewer, and its tiles are fetched alongside.
  */
 function _warmScene(targetScene) {
   const plate = state.viewerPlates[targetScene];
@@ -2013,13 +2014,13 @@ function _warmScene(targetScene) {
 }
 
 /**
- * Preload viewer cards for nearby scenes.
- * Respects the maxViewerCards pool limit from state.config.
+ * Preload plates for nearby scenes.
+ * Respects the viewer pool cap, state.config.maxViewerCards.
  *
  * Creates IIIF wrapper instances for scenes near the current scene so they are
  * initialised and ready when the user navigates to them.
  * Scene-based: counts distinct scenes, not step offsets, so a long
- * run of same-object steps doesn't count as multiple preload slots.
+ * scene of same-object steps doesn't count as multiple preload slots.
  *
  * @param {number} currentIndex - Current step index
  * @param {number} ahead - Scenes to preload ahead
@@ -2096,7 +2097,7 @@ function _prefetchTilesForScene(sceneIndex) {
 
       if (isNaN(x) || isNaN(y) || isNaN(zoom)) return;
 
-      const urls = _computeTileUrls(baseUrl, info, x, y, zoom);
+      const urls = _computeTileUrls(baseUrl, info, x, y, zoom, _plateViewerSize(sceneIndex));
       for (const url of urls) {
         const link = document.createElement('link');
         link.rel = 'prefetch';
@@ -2109,6 +2110,21 @@ function _prefetchTilesForScene(sceneIndex) {
 }
 
 /**
+ * The size a scene's viewer is framed in: its plate's content box, which the
+ * viewer fills, or the window while the plate has no layout.
+ *
+ * @param {number} sceneIndex
+ * @returns {{ width: number, height: number }}
+ */
+function _plateViewerSize(sceneIndex) {
+  const el = state.viewerPlates[sceneIndex]?.container;
+  if (el?.clientWidth > 0 && el.clientHeight > 0) {
+    return { width: el.clientWidth, height: el.clientHeight };
+  }
+  return { width: window.innerWidth, height: window.innerHeight };
+}
+
+/**
  * The tiling an image service advertises.
  *
  * A service that names neither a tile size nor a set of scale factors is
@@ -2116,7 +2132,7 @@ function _prefetchTilesForScene(sceneIndex) {
  * generated at.
  *
  * @param {Object} info - Parsed info.json
- * @returns {{ imageW: number, imageH: number, tileSize: number, scaleFactors: number[] }}
+ * @returns {{ imageW: number, imageH: number, tileSize: number, scaleFactors: number[], version: number }}
  */
 function _tileSourceShape(info) {
   return {
@@ -2124,123 +2140,240 @@ function _tileSourceShape(info) {
     imageH:       info.height,
     tileSize:     info.tiles?.[0]?.width || 512,
     scaleFactors: info.tiles?.[0]?.scaleFactors || [1],
+    version:      _imageApiVersion(info),
   };
 }
 
 /**
- * The image-pixel box a step's framing puts on screen.
+ * The IIIF Image API version an info.json describes: 3 where its context or
+ * type says so, 2 otherwise.
  *
- * The two-circle model answers with the authored focal point as centre and
- * the inscribed-circle diameter as width, so the prefetched region aligns
- * with the rendered one. A step it cannot answer for falls back to the
- * authored point and a viewport-relative estimate. Either way the box is
- * clamped to the image bounds.
+ * @param {Object} info - Parsed info.json
+ * @returns {2|3}
+ */
+function _imageApiVersion(info) {
+  const context = [].concat(info['@context'] || []).join(' ');
+  return (context.includes('/image/3/') || info.type === 'ImageService3') ? 3 : 2;
+}
+
+/**
+ * A static tile's URL, named as the viewer names it.
+ *
+ * A static tile set holds one file per name the viewer asks for, so a
+ * prefetch under any other name fetches nothing the viewer will use: it is
+ * not found. OpenSeadragon asks for a level narrower and shorter than one tile
+ * as the whole image at that level's size; a tile that is the whole image as
+ * region `full`; and a tile's size as `w,h` under API 3 and `w,` under API 2,
+ * except that the image's own full size is `max` under 3 and `full` under 2
+ * (where the width alone matches).
+ *
+ * @param {string} baseUrl - Image service base URL
+ * @param {{ imageW: number, imageH: number, tileSize: number, version: number }} shape
+ * @param {{ x: number, y: number, w: number, h: number }} tile - Image px
+ * @param {number} scaleFactor
+ * @returns {string}
+ */
+function _tileUrl(baseUrl, { imageW, imageH, tileSize, version }, tile, scaleFactor) {
+  const levelW = Math.ceil(imageW / scaleFactor);
+  const levelH = Math.ceil(imageH / scaleFactor);
+  const oneTile = levelW < tileSize && levelH < tileSize;
+
+  const region = oneTile || (tile.x === 0 && tile.y === 0 && tile.w === imageW && tile.h === imageH)
+    ? 'full'
+    : `${tile.x},${tile.y},${tile.w},${tile.h}`;
+
+  // Output pixels: the level's own size for a level under one tile, and
+  // otherwise the tile's image px at this level's scale.
+  const outW = oneTile ? levelW : Math.ceil(tile.w / scaleFactor);
+  const outH = oneTile ? levelH : Math.ceil(tile.h / scaleFactor);
+  let size;
+  if (version === 3) {
+    size = (outW === imageW && outH === imageH) ? 'max' : `${outW},${outH}`;
+  } else {
+    size = outW === imageW ? 'full' : `${outW},`;
+  }
+
+  return `${baseUrl}/${region}/${size}/0/default.jpg`;
+}
+
+/**
+ * The image-pixel box a step's framing puts on screen, and the scale it is
+ * shown at.
+ *
+ * Where the framing can be computed, the box is what the viewer shows at rest:
+ * visibleImageRegion is the rectangle the viewer is fitted to, cut to the
+ * image, and the scale is the placement's own (viewer px per image px). A step
+ * it cannot answer for falls back to the authored point and a viewport-relative
+ * estimate, clamped to the image bounds, at the scale that estimate assumes.
  *
  * @param {number} imageW
  * @param {number} imageH
  * @param {number} x - Normalised centre X (0-1)
  * @param {number} y - Normalised centre Y (0-1)
  * @param {number} zoom - OSD zoom multiplier
- * @returns {{ left: number, top: number, right: number, bottom: number }}
+ * @param {{ width: number, height: number }} [container] - The viewer's size,
+ *   the window's where not given.
+ * @returns {{ region: { left: number, top: number, right: number, bottom: number },
+ *   scale: number }}
  */
-function _prefetchRegion(imageW, imageH, x, y, zoom) {
+function _prefetchFraming(imageW, imageH, x, y, zoom, container) {
   // Derive cardBox and placementMode via the canonical helper in iiif-card.js.
   const vpW = window.innerWidth;
   const vpH = window.innerHeight;
   const r = state.cardOverlayRect;
   const cardBox = r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null;
   const placementMode = _deriveCardPlacement(cardBox, vpW, vpH);
+  const viewer = container || { width: vpW, height: vpH };
 
   const target = computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placementMode);
-  let centreX, centreY, halfW, halfH;
+  const shown = target && visibleImageRegion(target, zoom, viewer);
+  if (shown) return { region: shown, scale: framePlacement(target, zoom, viewer).s };
 
-  if (target) {
-    // The authored focal circle: centre = focalImg, radius = diameterImg/2
-    centreX = target.focalImg.x;
-    centreY = target.focalImg.y;
-    halfW   = target.diameterImg / 2;
-    halfH   = target.diameterImg / 2;
-  } else {
-    // Raw authored (x, y) with a viewport-relative size estimate
-    centreX = x * imageW;
-    centreY = y * imageH;
-    const pixelsPerViewportPx = 1 / (zoom * (vpW / imageW));
-    halfW = (vpW * pixelsPerViewportPx) / 2;
-    halfH = (vpH * pixelsPerViewportPx) / 2;
-  }
+  // Raw authored (x, y) with a viewport-relative size estimate
+  const centreX = x * imageW;
+  const centreY = y * imageH;
+  const scale = zoom * (vpW / imageW);
+  const halfW = vpW / scale / 2;
+  const halfH = vpH / scale / 2;
 
   return {
-    left:   Math.max(0, centreX - halfW),
-    top:    Math.max(0, centreY - halfH),
-    right:  Math.min(imageW, centreX + halfW),
-    bottom: Math.min(imageH, centreY + halfH),
+    region: {
+      left:   Math.max(0, centreX - halfW),
+      top:    Math.max(0, centreY - halfH),
+      right:  Math.min(imageW, centreX + halfW),
+      bottom: Math.min(imageH, centreY + halfH),
+    },
+    scale,
   };
 }
 
 /**
- * The coarsest level that covers a region in nine tiles or fewer.
+ * The image-pixel box a step's framing puts on screen (see _prefetchFraming).
  *
- * A higher scale factor is a lower-resolution level and so fewer tiles. The
- * first factor the service lists is the floor: a region needing more than
- * nine tiles at every level takes it anyway, and the grid walk caps what is
- * issued.
+ * @param {number} imageW
+ * @param {number} imageH
+ * @param {number} x - Normalised centre X (0-1)
+ * @param {number} y - Normalised centre Y (0-1)
+ * @param {number} zoom - OSD zoom multiplier
+ * @param {{ width: number, height: number }} [container]
+ * @returns {{ left: number, top: number, right: number, bottom: number }}
+ */
+function _prefetchRegion(imageW, imageH, x, y, zoom, container) {
+  return _prefetchFraming(imageW, imageH, x, y, zoom, container).region;
+}
+
+/**
+ * The finest level OpenSeadragon draws is the one whose pixels it shows at no
+ * less than this many screen pixels each (its minPixelRatio, left at the
+ * default by the viewer).
+ */
+const OSD_MIN_PIXEL_RATIO = 0.5;
+
+/**
+ * The scale factor OpenSeadragon draws a tiled IIIF source at once the viewer
+ * is at rest.
+ *
+ * Levels are powers of two: the finest is the log2 of the largest scale
+ * factor (rounded), and level L has scale factor 2^(max - L). The drawn level
+ * is the finest whose pixels are shown at OSD_MIN_PIXEL_RATIO or more screen
+ * pixels each, the display's pixel density included:
+ * TiledImage._getLevelsInterval takes |floor(log2(ratio at level 0 /
+ * minPixelRatio))|, capped at the finest level. The ratio at level L is
+ * density x scale x 2^(max - L), scale being viewer px per image px. Scale
+ * factors are a set, so only the largest is read. The level is the viewer's
+ * whether or not the service lists its scale factor.
  *
  * @param {number[]} scaleFactors - Scale factors the service advertises
- * @param {number} tileSize - Tile width in image pixels at scale factor 1
- * @param {{ left: number, top: number, right: number, bottom: number }} region
+ * @param {number} scale - Viewer px per image px at the resting framing
  * @returns {number}
  */
-function _prefetchScaleFactor(scaleFactors, tileSize, region) {
-  let scaleFactor = scaleFactors[0] || 1;
-  for (const sf of scaleFactors) {
-    const effectiveTile = tileSize * sf;
-    const tilesX = Math.ceil((region.right - region.left) / effectiveTile);
-    const tilesY = Math.ceil((region.bottom - region.top) / effectiveTile);
-    if (tilesX * tilesY <= 9) {
-      scaleFactor = sf;
-      break;
-    }
-  }
-  return scaleFactor;
+function _drawnScaleFactor(scaleFactors, scale) {
+  const maxLevel = Math.round(Math.log(Math.max(...scaleFactors, 1)) * Math.LOG2E);
+  const density = Math.max(window.devicePixelRatio || 1, 1);
+  const ratioAtLevel0 = density * scale * Math.pow(2, maxLevel);
+  const level = Math.min(
+    Math.abs(maxLevel),
+    Math.abs(Math.floor(Math.log(ratioAtLevel0 / OSD_MIN_PIXEL_RATIO) / Math.log(2))),
+  );
+  return Math.pow(2, maxLevel - level);
+}
+
+/**
+ * The cells of a level's tile grid OpenSeadragon walks for a region.
+ *
+ * Its walk runs from the cell holding the region's top-left corner to the cell
+ * holding its bottom-right, both ends inclusive, so an edge that lies exactly
+ * on a grid line also takes the cell that starts there. A corner at or past
+ * the image's far edge takes the last cell.
+ *
+ * @param {{ left: number, top: number, right: number, bottom: number }} region
+ * @param {number} effectiveTile - Tile width in image pixels at this level
+ * @param {number} imageW
+ * @param {number} imageH
+ * @returns {{ x0: number, x1: number, y0: number, y1: number }} Inclusive-start,
+ *   exclusive-end indices
+ */
+function _cellRange(region, effectiveTile, imageW, imageH) {
+  const columns = Math.ceil(imageW / effectiveTile);
+  const rows = Math.ceil(imageH / effectiveTile);
+  return {
+    x0: Math.min(Math.floor(region.left / effectiveTile), columns - 1),
+    x1: Math.min(Math.floor(region.right / effectiveTile), columns - 1) + 1,
+    y0: Math.min(Math.floor(region.top / effectiveTile), rows - 1),
+    y1: Math.min(Math.floor(region.bottom / effectiveTile), rows - 1) + 1,
+  };
+}
+
+/**
+ * The most cells one scene prefetches.
+ *
+ * The level OpenSeadragon draws shows each of its pixels at no less than
+ * OSD_MIN_PIXEL_RATIO screen pixels, so a tile spans at least half its width
+ * in viewer px (less the pixel density) and the viewer holds at most
+ * ceil(size / that) tiles along an axis, plus one for the grid line it
+ * straddles. The bound only bites where the framing is degenerate.
+ *
+ * @param {number} tileSize - Tile width in level pixels
+ * @param {{ width: number, height: number }} viewer
+ * @returns {number}
+ */
+function _cellBound(tileSize, viewer) {
+  const density = Math.max(window.devicePixelRatio || 1, 1);
+  const smallestTile = (tileSize * OSD_MIN_PIXEL_RATIO) / density;
+  return (Math.ceil(viewer.width / smallestTile) + 1) * (Math.ceil(viewer.height / smallestTile) + 1);
 }
 
 /**
  * The static tile URLs covering a region at one level.
  *
- * Tiles sit on the level's own grid, so the walk starts at the tile holding
+ * Tiles sit on the level's own grid, so the walk starts at the cell holding
  * the region's edge rather than at the edge itself. A tile the image bound
- * clips to nothing is skipped, and nine is the ceiling on what one scene
- * prefetches.
+ * clips to nothing is skipped, and the count is held to `limit`.
  *
  * @param {string} baseUrl - Image service base URL
  * @param {{ left: number, top: number, right: number, bottom: number }} region
- * @param {number} imageW
- * @param {number} imageH
- * @param {number} tileSize - Tile width in image pixels at scale factor 1
+ * @param {{ imageW: number, imageH: number, tileSize: number, version: number }} shape
  * @param {number} scaleFactor
+ * @param {number} limit - Most tiles to issue
  * @returns {string[]} Array of tile URLs
  */
-function _tileUrlsForRegion(baseUrl, region, imageW, imageH, tileSize, scaleFactor) {
+function _tileUrlsForRegion(baseUrl, region, shape, scaleFactor, limit) {
+  const { imageW, imageH, tileSize } = shape;
   const effectiveTile = tileSize * scaleFactor;
+  const { x0, x1, y0, y1 } = _cellRange(region, effectiveTile, imageW, imageH);
   const urls = [];
 
-  for (let tx = Math.floor(region.left / effectiveTile); tx * effectiveTile < region.right; tx++) {
-    for (let ty = Math.floor(region.top / effectiveTile); ty * effectiveTile < region.bottom; ty++) {
+  for (let tx = x0; tx < x1; tx++) {
+    for (let ty = y0; ty < y1; ty++) {
       const rx = tx * effectiveTile;
       const ry = ty * effectiveTile;
       const rw = Math.min(effectiveTile, imageW - rx);
       const rh = Math.min(effectiveTile, imageH - ry);
       if (rw <= 0 || rh <= 0) continue;
 
-      // Output tile size: actual pixels / scaleFactor (IIIF Level 0 static tiles)
-      const outW = Math.ceil(rw / scaleFactor);
+      urls.push(_tileUrl(baseUrl, shape, { x: rx, y: ry, w: rw, h: rh }, scaleFactor));
 
-      // IIIF Image API Level 0 URL pattern:
-      // {base}/{region_x},{region_y},{region_w},{region_h}/{output_w},/0/default.jpg
-      const url = `${baseUrl}/${rx},${ry},${rw},${rh}/${outW},/0/default.jpg`;
-      urls.push(url);
-
-      if (urls.length >= 9) return urls; // Cap at 9 tiles
+      if (urls.length >= limit) return urls;
     }
   }
 
@@ -2251,24 +2384,28 @@ function _tileUrlsForRegion(baseUrl, region, imageW, imageH, tileSize, scaleFact
  * IIIF Image API Level 0 tile URLs for the region a step frames.
  *
  * Four questions in order: what the image service advertises, which box of
- * image pixels the step puts on screen, the coarsest level that covers that
- * box in nine tiles, and which tiles of that level those are.
+ * image pixels the step puts on screen and at what scale, the level
+ * OpenSeadragon draws at that scale, and which tiles of that level the box
+ * meets.
  *
  * @param {string} baseUrl - Image service base URL (e.g. origin + /iiif/objects/leviathan)
  * @param {Object} info - Parsed info.json
  * @param {number} x - Normalised centre X (0-1)
  * @param {number} y - Normalised centre Y (0-1)
  * @param {number} zoom - OSD zoom multiplier
+ * @param {{ width: number, height: number }} [container] - The viewer's size,
+ *   the window's where not given.
  * @returns {string[]} Array of tile URLs
  */
-function _computeTileUrls(baseUrl, info, x, y, zoom) {
-  const { imageW, imageH, tileSize, scaleFactors } = _tileSourceShape(info);
-  const region = _prefetchRegion(imageW, imageH, x, y, zoom);
-  const scaleFactor = _prefetchScaleFactor(scaleFactors, tileSize, region);
+function _computeTileUrls(baseUrl, info, x, y, zoom, container) {
+  const shape = _tileSourceShape(info);
+  const viewer = container || { width: window.innerWidth, height: window.innerHeight };
+  const { region, scale } = _prefetchFraming(shape.imageW, shape.imageH, x, y, zoom, viewer);
+  const scaleFactor = _drawnScaleFactor(shape.scaleFactors, scale);
 
-  return _tileUrlsForRegion(baseUrl, region, imageW, imageH, tileSize, scaleFactor);
+  return _tileUrlsForRegion(baseUrl, region, shape, scaleFactor, _cellBound(shape.tileSize, viewer));
 }
 
 // Exported for unit testing under an alias without underscore (matches the
 // _buildSceneMaps as buildSceneMaps pattern above).
-export { _computeTileUrls as computeTileUrls };
+export { _computeTileUrls as computeTileUrls, _prefetchRegion as prefetchRegion };

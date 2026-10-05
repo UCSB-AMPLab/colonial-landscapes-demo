@@ -56,16 +56,24 @@ stored key.
 Version: v1.8.0
 """
 
+import bisect
+import datetime
 import html
+import itertools
+import math
 import re
-from pathlib import Path
-import pandas as pd
+from html.parser import HTMLParser
+from typing import NamedTuple, Optional
+
+import yaml
+
 from telar.config import get_lang_string
 from telar.widgets import render_widget_html, site_base_url
 from telar.glossary_kinds import (default_kind, front_matter_kind, kind_icon,
                                   kind_text, resolve_kind)
 from telar.story_pages import jekyll_slug
-from telar.csv_utils import ColumnCollisionError, ReservedColumnError
+from telar.csv_utils import (GLOSSARY_COLUMN_ALIASES, ColumnCollisionError, ReservedColumnError,
+                             is_header_row, normalize_column_names, read_sheet)
 
 
 class GlossaryTerms(dict):
@@ -79,139 +87,187 @@ class GlossaryTerms(dict):
         self.kinds = {}
 
 
-def load_glossary_from_csv(csv_path):
+def read_glossary_sheet(csv_path):
+    """glossary.csv as the build reads it, for every reader of it: the link
+    map, the pages, and the conversion that reads it as a story sheet.
+
+    In order: a row whose first cell starts with `#` is a comment and goes;
+    instruction columns (`#` in the header) go; the columns take their
+    English names, the glossary's own aliases included, and are folded to
+    lower case, so a sheet headed `Term_ID` is found; and a first row left
+    that is a second, bilingual header row goes, judged with the glossary's
+    aliases. A comment row is gone before that judgement, so it can never
+    be taken for the header row, or kept as a term when it is not one.
+
+    Every column is text the author typed. Left to infer, pandas reads a
+    term titled `null` or `NA` as a missing value, and decides per column.
+    A column collision is refused with the sheet's path, as the page
+    generator and the link map both refuse it.
     """
-    Load glossary terms from a CSV file.
-
-    Args:
-        csv_path: Path to glossary.csv
-
-    Returns:
-        GlossaryTerms: term_id to term title, with each entry's kind
-    """
-    glossary_terms = GlossaryTerms()
-
+    df = read_sheet(csv_path, dtype=str, keep_default_na=False)
+    if len(df.columns):
+        df = df[~df[df.columns[0]].astype(str).str.strip().str.startswith('#')]
+    df = df[[col for col in df.columns if not col.startswith('#')]]
     try:
-        # Every column here is text the author typed. Left to infer, pandas
-        # reads a term titled `null` or `NA` as a missing value and the page
-        # is written `nan`, and it decides per column, so the same title
-        # survives or does not depending on what its neighbours look like.
-        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-
-        # Normalize column names (bilingual mapping). normalize_column_names
-        # already lowercases internally for lookup, so pre-lowercasing here was
-        # redundant and needlessly mutated the actual header labels, diverging
-        # from every other CSV's column-casing behaviour.
-        from telar.csv_utils import normalize_column_names, GLOSSARY_COLUMN_ALIASES
         df = normalize_column_names(df, sheet_aliases=GLOSSARY_COLUMN_ALIASES)
-
-        if 'term_id' not in df.columns or 'title' not in df.columns:
-            print(f"  ⚠️ glossary.csv missing required columns (term_id, title)")
-            return glossary_terms
-
-        for _, row in df.iterrows():
-            term_id = str(row.get('term_id', '')).strip()
-            title = str(row.get('title', '')).strip()
-
-            # A row whose id begins `#` is a comment the author left for
-            # themselves, and the page generator gives it no page. The link
-            # map has to exclude it on the same stripped value, or a term
-            # resolves to a link with nothing behind it. `strip()` settles
-            # every way such a row can arrive -- leading spaces, and the
-            # U+0085 a paste into a spreadsheet cell can carry.
-            if term_id.startswith('#'):
-                continue
-
-            if term_id and title:
-                glossary_terms[term_id] = title
-                # The page generator reads the same cell and warns about it.
-                glossary_terms.kinds[term_id] = resolve_kind(
-                    row.get('kind', ''), warn=False)
-
     except (ColumnCollisionError, ReservedColumnError) as e:
-        # The page generator reads this same file and fails the build on
-        # these two. A loader that swallowed them handed back an empty link
-        # map, so whether the author heard about the sheet at all depended
-        # on which path ran first. Both refuse alike. The path goes with the
-        # error because it surfaces inside each story's conversion, where
-        # the file being converted is the story, not the one to change.
         e.source = str(csv_path)
         raise
-    except Exception as e:
-        print(f"  ⚠️ Could not load glossary.csv: {e}")
+    df.columns = df.columns.str.lower().str.strip()
+    if len(df) > 0 and is_header_row(df.iloc[0].values, sheet_aliases=GLOSSARY_COLUMN_ALIASES):
+        df = df.iloc[1:]
+    return df.reset_index(drop=True)
 
-    return glossary_terms
 
-
-def load_glossary_from_markdown(glossary_dir):
-    """
-    Load glossary terms from markdown files (legacy method).
-
-    Args:
-        glossary_dir: Path to telar-content/texts/glossary/
-
-    Returns:
-        GlossaryTerms: term_id to term title, with each entry's kind
-    """
-    glossary_terms = GlossaryTerms()
-
+def markdown_glossary_title(frontmatter_text):
+    """The `title` of a legacy glossary file's front matter as the page
+    generated from it reads it, or None when it has none or the front
+    matter is not a YAML mapping. The page copies the front matter
+    verbatim, so the title is what a YAML reader makes of it: quotes and a
+    trailing comment are not part of it, and `subtitle:` is another key."""
     try:
-        for glossary_file in glossary_dir.glob('*.md'):
-            with open(glossary_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+        fields = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fields, dict) or fields.get('title') is None:
+        return None
+    # A YAML reader gives `Z` and `+00:00` as the same zone; Ruby prints them
+    # differently, so the written form decides.
+    zulu = re.search(r'^title:[ \t]*[0-9][^\n#]*[Zz][ \t]*(?:#.*)?$',
+                     frontmatter_text, re.MULTILINE) is not None
+    return _as_liquid_text(fields['title'], zulu)
 
-            # Parse frontmatter
-            frontmatter_pattern = r'^---\s*\n(.*?)\n---\s*\n'
-            match = re.match(frontmatter_pattern, content, re.DOTALL)
 
-            if match:
-                frontmatter_text = match.group(1)
-
-                # Extract term_id and title
-                term_id_match = re.search(r'term_id:\s*(\S+)', frontmatter_text)
-                title_match = re.search(r'title:\s*["\']?(.*?)["\']?\s*$', frontmatter_text, re.MULTILINE)
-
-                if term_id_match and title_match:
-                    term_id = term_id_match.group(1)
-                    title = title_match.group(1)
-                    glossary_terms[term_id] = title
-                    glossary_terms.kinds[term_id] = resolve_kind(
-                        front_matter_kind(frontmatter_text), warn=False)
-
-    except Exception as e:
-        print(f"  ⚠️ Could not load glossary markdown files: {e}")
-
-    return glossary_terms
+def _as_liquid_text(value, zulu=False):
+    """A YAML value as the page prints it: Ruby's reading of it, rendered
+    by Liquid. Not matched: a sexagesimal number (`12:34`), which the two
+    YAML libraries read differently, a `Z` time inside a list, printed with
+    its offset, and a mapping inside a list, printed in Python's form."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, float) and math.isinf(value):
+        return 'Infinity' if value > 0 else '-Infinity'
+    if isinstance(value, float) and math.isnan(value):
+        return 'NaN'
+    if isinstance(value, datetime.datetime):
+        # Ruby prints a time written with `Z` in UTC, one written with an
+        # offset at that offset, and one with no zone as UTC moved to the
+        # build machine's local time.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc).astimezone()
+        elif value.tzinfo is datetime.timezone.utc and zulu:
+            return value.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+        return value.strftime('%Y-%m-%d %H:%M:%S %z')
+    if isinstance(value, list):
+        return ''.join(_as_liquid_text(item) for item in value)
+    if value is None:
+        return ''
+    return str(value)
 
 
 def load_glossary_terms():
     """
-    Load glossary terms from CSV or markdown files.
+    The link map for the site's own glossary: the terms that have a page.
 
-    Checks for glossary.csv first, then glosario.csv (Spanish-language
-    spreadsheet support), then falls back to markdown files.
-    If both CSV and markdown exist, CSV takes precedence and a warning is shown.
+    The map is `site_glossary_pages()`, the decision the page generator
+    writes its pages from (glossary.csv or glosario.csv when present, else
+    the legacy markdown files), so a term is linkable exactly when a page
+    exists for it. A term without a page resolves as missing.
+
+    The generator reports why a sheet publishes no pages (a missing required
+    column) when it runs. This reader runs once per story, so it leaves that
+    one report to the generator; every other warning the read raises is shown.
 
     Returns:
-        dict: Dictionary mapping term_id to term title, or empty dict if no glossary found
+        GlossaryTerms: term_id to term title, with each entry's kind; empty
+        when the site has no glossary content
     """
-    csv_path = Path('telar-content/spreadsheets/glossary.csv')
-    if not csv_path.exists():
-        fallback = Path('telar-content/spreadsheets/glosario.csv')
-        if fallback.exists():
-            csv_path = fallback
-    md_path = Path('telar-content/texts/glossary')
+    # Imported here: glossary_pages imports this module.
+    from telar.glossary_pages import site_glossary_pages
 
-    # Check if CSV exists (preferred source)
-    if csv_path.exists():
-        return load_glossary_from_csv(csv_path)
+    try:
+        pages = site_glossary_pages(warn_missing=False)
+    except (ColumnCollisionError, ReservedColumnError):
+        raise
+    except Exception as e:
+        print(f"  ⚠️ Could not load glossary: {e}")
+        return GlossaryTerms()
+    return glossary_link_map(pages)
 
-    # Fall back to markdown files
-    elif md_path.exists() and any(md_path.glob('*.md')):
-        return load_glossary_from_markdown(md_path)
 
-    # No glossary content
-    return {}
+def glossary_link_map(pages):
+    """The link map of `site_glossary_pages()`'s pages, as `load_glossary_terms`
+    returns it."""
+    glossary_terms = GlossaryTerms()
+    for term_id, (title, kind) in pages.items():
+        glossary_terms[term_id] = title
+        glossary_terms.kinds[term_id] = kind
+    return glossary_terms
+
+
+def glossary_term_address(term_id):
+    """The site-relative path (no baseurl) a glossary term's page is
+    published at, `/glossary/<slug>/`."""
+    return f'/glossary/{glossary_term_slug(term_id)}/'
+
+
+def first_at_each_address(entries, warn=True):
+    """The entries that are written, in order, as [(term_id, item)] of the
+    `entries` given as (term_id, item).
+
+    Ids that share a slug share an address, and Jekyll writes one page for
+    each; the first is kept and the others are not published or linkable.
+    `warn` says whether each dropped entry is reported.
+    """
+    kept, held = [], {}
+    for term_id, item in entries:
+        address = glossary_term_address(term_id)
+        if address not in held:
+            held[address] = term_id
+            kept.append((term_id, item))
+        elif warn:
+            print(f"  ⚠️ Glossary entries '{held[address]}' and '{term_id}' would both "
+                  f"be published at {address}. '{held[address]}' keeps that address; "
+                  f"'{term_id}' is not published and cannot be linked.")
+    return kept
+
+
+class DemoTermPlacement(NamedTuple):
+    """What becomes of one demo glossary term (`place_demo_terms`).
+
+    `written` is True when the term's own page is written at
+    `/glossary/<slug>/` in `_glossary/<term_id>.md`. Otherwise `owner` is
+    the term whose page holds that address, `owner_is_site` says whose, and
+    the demo id links to the owner's page.
+    """
+    term_id: str
+    written: bool
+    owner: Optional[str]
+    owner_is_site: bool
+
+
+def place_demo_terms(site_pages, demo_ids):
+    """The one decision of which demo glossary terms are written and what
+    each demo id links to, as a DemoTermPlacement per id, in order.
+
+    `site_pages` is the site's glossary pages in the order they are written
+    (a mapping of term ids), already placed by `first_at_each_address`.
+    `demo_ids` is the bundle's glossary ids in order. Only a written page
+    holds its address, so a term skipped earlier leaves it free for a later
+    one. A skipped id is linked to the page that holds its address.
+    """
+    held = {}
+    for term_id in site_pages:
+        held.setdefault(glossary_term_address(term_id), (term_id, True))
+
+    placements = []
+    for term_id in demo_ids:
+        owner = held.setdefault(glossary_term_address(term_id), (term_id, False))
+        if owner == (term_id, False):
+            placements.append(DemoTermPlacement(term_id, True, None, False))
+        else:
+            placements.append(DemoTermPlacement(term_id, False, *owner))
+    return placements
 
 
 def glossary_term_slug(term_id):
@@ -230,7 +286,7 @@ def glossary_term_url(term_id, base_url=None):
     """The site-relative URL of a glossary term's page, baseurl included."""
     if base_url is None:
         base_url = site_base_url()
-    return f'{base_url}/glossary/{glossary_term_slug(term_id)}/'
+    return base_url + glossary_term_address(term_id)
 
 
 # Matches the markup that process_glossary_links emits: a resolved inline link
@@ -307,7 +363,7 @@ def _glossary_callout(match, glossary_terms, lower_map, warnings_list,
     if term_id is None:
         return _missing_entry(raw_term_id, raw_term_id, warnings_list,
                               step_num, layer_name)
-    kind = getattr(glossary_terms, 'kinds', {}).get(term_id, default_kind())
+    kind = glossary_terms.kinds.get(term_id, default_kind())
     rendered = render_widget_html('glossary', {
         'term_id': term_id,
         'term_url': glossary_term_url(term_id, base_url),
@@ -322,13 +378,278 @@ def _glossary_callout(match, glossary_terms, lower_map, warnings_list,
     return ' '.join(line.strip() for line in rendered.splitlines() if line.strip())
 
 
+class GlossaryLink(NamedTuple):
+    """One `[[term]]` or `[[term|display]]` in a text: where it starts and
+    ends, and its two parts as the syntax reads them, `display` being None
+    for a link without a `|`."""
+    start: int
+    end: int
+    term: str
+    display: Optional[str]
+
+
+_LINK_DELIMITER_RE = re.compile(r'[|\]]')
+
+
+def _link_part(text, start, end):
+    """A part of a link, stripped of whitespace; a part that is nothing but
+    whitespace is its last character, which the syntax keeps as the part."""
+    part = text[start:end]
+    return part.strip() or part[-1]
+
+
+def find_glossary_links(text):
+    """The glossary links in *text*, in order and without overlap.
+
+    The links are exactly the matches of
+    `\\[\\[\\s*([^|\\]]+?)(?:\\s*\\|\\s*([^|\\]]+?))?\\s*\\]\\]` under
+    `re.finditer`, which is how the Compositor reads the syntax, so the
+    two agree on every text: `[[[term]]]` is the entry `[term`, and
+    `[[term [note]]]` the entry `term [note`. Neither part can hold `|` or
+    `]`, so a link opened at `[[` ends at the first `]]` or `|` after it,
+    and a link with a `|` at the first `]]` after that. Each is found by
+    one search, reused for every opening that shares it, so the text is
+    read in linear time, where the expression's backtracking is quadratic
+    on a run of `[` and worse on whitespace before a `|`.
+    """
+    length = len(text)
+
+    def delimiter_from(index):
+        match = _LINK_DELIMITER_RE.search(text, index)
+        return match.start() if match else length
+
+    # The first delimiter at or after `searched_from` is `bar`; every
+    # opening whose term starts in that range shares it.
+    searched_from = bar = -1
+    # The delimiter after the `|` at `after_bar`, which ends the display.
+    after_bar = close = -1
+
+    start = text.find('[[')
+    while start != -1:
+        term_start = start + 2
+        if not searched_from <= term_start <= bar:
+            searched_from, bar = term_start, delimiter_from(term_start)
+        link = None
+        if term_start < bar < length:
+            if text[bar] == ']':
+                if text.startswith(']]', bar):
+                    link = GlossaryLink(start, bar + 2, _link_part(text, term_start, bar), None)
+            else:
+                if after_bar != bar:
+                    after_bar, close = bar, delimiter_from(bar + 1)
+                if close > bar + 1 and text.startswith(']]', close):
+                    link = GlossaryLink(start, close + 2, _link_part(text, term_start, bar),
+                                        _link_part(text, bar + 1, close))
+        if link is None:
+            start = text.find('[[', start + 1)
+        else:
+            yield link
+            start = text.find('[[', link.end)
+
+
+class _PanelHTML(HTMLParser):
+    """A panel's HTML read by Python's HTML tokenizer, for two kinds of
+    stretch, as (start, end) offsets.
+
+    `regions` holds the content of each `<a>` element: a tag inside a
+    comment, another tag's attribute or text-only content is not a tag,
+    and one whose offset *skip* (a test of an offset range) holds is not
+    one either. As a browser keeps them, an element ends at its `</a>` or
+    where the next `<a>` opens, `<a/>` opens one, and one never closed runs
+    to the end of the text.
+
+    `raw_texts` holds the content of each element whose content is text
+    only (`script`, `style`, `textarea` and the others the tokenizer reads
+    so), to its closing tag or the end of the text: markup written there is
+    not markup."""
+
+    def __init__(self, text, skip):
+        super().__init__(convert_charrefs=False)
+        self.skip = skip
+        self.text_only = (self.CDATA_CONTENT_ELEMENTS
+                          + getattr(self, 'RCDATA_CONTENT_ELEMENTS', ()))
+        self.line_starts = [0] + [match.end() for match in re.finditer('\n', text)]
+        self.regions, self.content = [], None
+        self.raw_texts, self.raw_text = [], None
+        # A character reference never starts or ends a tag, and how the
+        # tokenizer reads a malformed one (`&#`, `&#5a`) differs between
+        # Python versions and moves the positions it reports. Each `&` is
+        # read as a space, which keeps every offset and the same tags in
+        # every version the build may run.
+        self.feed(text.replace('&', ' '))
+        self.close()
+        if self.content is not None:
+            self.regions.append((self.content, len(text)))
+        if self.raw_text is not None:
+            self.raw_texts.append((self.raw_text[1], len(text)))
+
+    def tag_offset(self):
+        """The offset of the tag being read."""
+        line, column = self.getpos()
+        return self.line_starts[line - 1] + column
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.text_only:
+            self.raw_text = (tag, self.tag_offset() + len(self.get_starttag_text()))
+        elif tag == 'a':
+            self.open_anchor()
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == 'a':
+            self.open_anchor()
+
+    def open_anchor(self):
+        start = self.tag_offset()
+        end = start + len(self.get_starttag_text())
+        if self.skip(start, end):
+            return
+        if self.content is not None:
+            self.regions.append((self.content, start))
+        self.content = end
+
+    def handle_endtag(self, tag):
+        if self.raw_text is not None and tag == self.raw_text[0]:
+            self.raw_texts.append((self.raw_text[1], self.tag_offset()))
+            self.raw_text = None
+        elif tag == 'a' and self.content is not None:
+            start = self.tag_offset()
+            if not self.skip(start, start + 1):
+                self.regions.append((self.content, start))
+                self.content = None
+
+
+# A start tag of an element whose content `_PanelHTML` reads as text, as
+# the tokenizer finds one: no such tag, no such content.
+_TEXT_ONLY_TAG_RE = re.compile(
+    '<(?:' + '|'.join(HTMLParser.CDATA_CONTENT_ELEMENTS
+                      + getattr(HTMLParser, 'RCDATA_CONTENT_ELEMENTS', ())) + r')(?![a-z0-9-])',
+    re.IGNORECASE | re.ASCII)
+
+
+def _text_only_regions(text):
+    """The content of each element in *text* whose content a browser takes
+    as text (`script`, `style`, `textarea` and the others `_PanelHTML`
+    reads so), as (start, end) offsets."""
+    if not _TEXT_ONLY_TAG_RE.search(text):
+        return []
+    return _PanelHTML(text, _no_range).raw_texts
+
+
+def _no_range(start, end):
+    """A test of an offset range that holds no range."""
+    return False
+
+
+def _merged(regions):
+    """*regions* sorted, with those that overlap made one."""
+    merged = []
+    for start, end in sorted(regions):
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+# A code element: its content stops at the next opening of the same
+# element, so one that is never closed does not make the search rescan the
+# rest of the text.
+_CODE_ELEMENT = re.compile(r'<(code|pre|kbd|samp)\b[^>]*>(?:(?!<\1\b).)*?</\1\s*>',
+                           re.DOTALL | re.IGNORECASE)
+
+
+def code_elements(text):
+    """Every code element in HTML *text*, as (start, end) offsets."""
+    return [match.span() for match in _CODE_ELEMENT.finditer(text)]
+
+
+def overlaps(regions):
+    """A test of whether (start, end) overlaps any of *regions*, which may
+    overlap each other: a search, not a pass over every region."""
+    ordered = sorted(regions)
+    starts = [start for start, _ in ordered]
+    reach = list(itertools.accumulate((end for _, end in ordered), max))
+
+    def test(start, end):
+        count = bisect.bisect_left(starts, end)
+        return count > 0 and reach[count - 1] > start
+    return test
+
+
+def _link_text_regions(text):
+    """Where the text of a link is in HTML *text*, as sorted,
+    non-overlapping (start, end) offsets: the content of each `<a>`
+    element as an HTML tokenizer reads it, outside code elements."""
+    return _merged(_PanelHTML(text, overlaps(code_elements(text))).regions)
+
+
+def _region_around(regions, starts, start):
+    """The (start, end) region of *regions*, whose starts are *starts*,
+    holding offset *start*, or the one whose text begins just after it: a
+    `[` that opens a link's text counts as inside it. None when there is
+    none."""
+    after = bisect.bisect_right(starts, start + 1)
+    for number in (after - 2, after - 1):
+        if number >= 0 and regions[number][0] - 1 <= start < regions[number][1]:
+            return regions[number]
+    return None
+
+
+def _term_in_link_text(link, text, regions, starts):
+    """The glossary link to replace when *link* lies in a link's text, as
+    (link, True); (link, False) when it does not lie in one; or
+    (None, True) when there is nothing to replace.
+
+    Where a link's text is `[[term]]` with a bracket before it, the
+    syntax reads `[term` as the term; the term is the inner link there.
+    """
+    region = _region_around(regions, starts, link.start)
+    if region is None:
+        return link, False
+    if not link.term.startswith('['):
+        return link, link.start >= region[0]
+    inner = next(find_glossary_links(text[link.start + 1:link.end]), None)
+    if inner is None or inner.start != 0:
+        return None, True
+    return GlossaryLink(link.start + 1, link.start + 1 + inner.end, inner.term,
+                        inner.display), True
+
+
+def _plain_term(raw_term_id, display_text, canonical_id, glossary_terms,
+                warnings_list, step_num, layer_name):
+    """A term inside the text of a link, as the plain text it shows.
+
+    A link cannot hold a link, so the term is not linked: it shows its
+    display text, or its title, or, when the glossary has no such entry,
+    the text as written. The build says so either way.
+    """
+    if canonical_id is None:
+        message = get_lang_string('errors.object_warnings.glossary_term_not_found',
+                                  term_id=raw_term_id)
+        shown = display_text or raw_term_id
+    else:
+        message = get_lang_string('errors.object_warnings.glossary_term_in_link_text',
+                                  term_id=raw_term_id)
+        shown = display_text or glossary_terms[canonical_id]
+    if warnings_list is not None:
+        warnings_list.append({
+            'step': step_num,
+            'type': 'glossary',
+            'term_id': raw_term_id,
+            'layer': layer_name,
+            'message': message,
+        })
+    return html.escape(html.unescape(shown))
+
+
 def process_glossary_links(text, glossary_terms, warnings_list=None, step_num=None, layer_name=None,
                            base_url=None):
     """
     Transform [[term]] or [[display|term]] syntax into glossary link HTML.
 
     Args:
-        text: HTML text to process (already converted from markdown)
+        text: HTML text to process (already converted from markdown, with
+            its maths still held out as placeholders)
         glossary_terms: Dictionary mapping term_id to term title
         warnings_list: Optional list to append warning messages
         step_num: Optional step number for warning messages
@@ -343,28 +664,22 @@ def process_glossary_links(text, glossary_terms, warnings_list=None, step_num=No
         return text
 
     # Build a case-insensitive lookup that resolves an author's [[term]] (any
-    # casing) to the ACTUAL stored key. Glossary loaders store term_id verbatim
-    # — load_glossary_from_csv, load_glossary_from_markdown, and the demo bundle
-    # do not lowercase keys (e.g. the demo glossary stores 'IIIF'). Resolving to
-    # the stored key (rather than a lowercased copy) keeps the rendered
-    # data-term-id and title lookup on the key the glossary holds. Mirrors the
-    # objects_lower_map pattern in stories.py.
+    # casing) to the stored key. The glossary sources store term_id verbatim
+    # (the demo glossary stores 'IIIF'), and resolving to the stored key
+    # rather than a lowercased copy keeps the rendered data-term-id and title
+    # lookup on the key the glossary holds.
     # If two keys differ only by case, the last one wins — acceptable because the
     # glossary page system would already collide on such keys.
     glossary_lower_map = {key.lower(): key for key in (glossary_terms or {})}
 
-    # Pattern: [[display|term]] or [[term]] with flexible spacing
-    # Captures: (optional_display) | (term_id)
-    pattern = r'\[\[\s*([^|\]]+?)(?:\s*\|\s*([^|\]]+?))?\s*\]\]'
-
-    def replace_glossary_link(match):
+    def replace_glossary_link(link, in_link_text=False):
         # If pipe is present: [[term|display]], else [[term]]
-        if match.group(2):  # Has pipe
-            raw_term_id = match.group(1).strip()
-            display_text = match.group(2).strip()
+        if link.display:  # Has pipe
+            raw_term_id = link.term.strip()
+            display_text = link.display.strip()
             has_custom_display = True
         else:  # No pipe
-            raw_term_id = match.group(1).strip()
+            raw_term_id = link.term.strip()
             display_text = None
             has_custom_display = False
 
@@ -374,6 +689,10 @@ def process_glossary_links(text, glossary_terms, warnings_list=None, step_num=No
         # Match case-insensitively and resolve to the actual stored key so the
         # title lookup succeeds; the page URL is derived from that key.
         canonical_id = glossary_lower_map.get(raw_term_id.lower())
+
+        if in_link_text:
+            return _plain_term(raw_term_id, display_text, canonical_id, glossary_terms,
+                               warnings_list, step_num, layer_name)
 
         # Check if term exists in glossary (case-insensitive)
         if canonical_id is not None:
@@ -394,23 +713,34 @@ def process_glossary_links(text, glossary_terms, warnings_list=None, step_num=No
                     f'{html.escape(html.unescape(display_text))}</a>')
         else:
             # Invalid term - create error indicator (author's original casing preserved)
-            return _missing_entry(raw_term_id, match.group(1), warnings_list,
+            return _missing_entry(raw_term_id, link.term, warnings_list,
                                   step_num, layer_name)
 
     # Text is linked, a tag never: [[term]] inside an attribute (an image's
     # alt text) stays literal, or the link it made would end the attribute.
     # A quoted attribute value may hold '>', so it does not end the tag.
+    # Code is shown as written, so [[term]] in a code element is the syntax,
+    # not a link. So is the content of a `script`, `style` or other element
+    # whose content is text only.
     tags = [m.span() for m in re.finditer(
         r'<[A-Za-z/!](?:[^<>"\']|"[^"]*"|\'[^\']*\')*>', text)]
+    literal = overlaps(tags + code_elements(text) + _text_only_regions(text))
 
-    def link_outside_tags(match):
-        start = match.start()
-        if any(a < start < b for a, b in tags):
-            return match.group(0)
-        return replace_glossary_link(match)
+    # A link cannot hold a link: a term in a link's text is shown, not linked.
+    link_regions = _link_text_regions(text)
+    link_starts = [start for start, _ in link_regions]
 
     if glossary_terms:
-        text = re.sub(pattern, link_outside_tags, text)
+        pieces, written = [], 0
+        for found in find_glossary_links(text):
+            if literal(found.start, found.start + 1):
+                continue
+            link, in_link_text = _term_in_link_text(found, text, link_regions, link_starts)
+            if link is None:
+                continue
+            pieces += [text[written:link.start], replace_glossary_link(link, in_link_text)]
+            written = link.end
+        text = ''.join(pieces) + text[written:]
     # After the links: the marker an unknown callout leaves reads as
     # [[entry]], which the link pass would report a second time.
     return _CALLOUT_SLOT_RE.sub(

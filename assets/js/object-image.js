@@ -2,10 +2,9 @@
 (() => {
   // assets/js/object-page/boot.js
   function readObjectData(doc = document) {
-    const block = doc.getElementById("telar-object-data");
-    if (!block) return null;
+    const text = doc.getElementById("telar-object-data").textContent;
     try {
-      return JSON.parse(block.textContent);
+      return JSON.parse(text);
     } catch (err) {
       console.error("Object page data block is not valid JSON:", err);
       return null;
@@ -108,12 +107,19 @@
     scrollProgress: 0,
     /** Whether a snap animation is currently in flight. */
     isSnapping: false,
-    /** Set true during scroll-driven activateCard calls so card-pool skips the 4s OSD animation. */
+    /** Set true during scroll-driven activateCard calls, so the plate does not animate the camera the scroll is placing. */
     scrollDriven: false,
     /** Lenis instance reference — used by panels.js to stop/start scroll. */
     lenis: null,
     /** Snap plugin instance reference. */
     snap: null,
+    /**
+     * Pixels one step occupies on the scroll surface: the viewport height the
+     * surface was last laid out for, which trails the window by the resize
+     * debounce. Every conversion between a step and a scroll offset uses it;
+     * 0 when the scroll engine is not running.
+     */
+    scrollStepPx: 0,
     /** Quick lookup: object_id → object data from window.objectsData. */
     objectsIndex: {},
     // ── Panels ───────────────────────────────────────────────────────────────
@@ -135,22 +141,22 @@
     isEmbed: false,
     /** @type {DOMRect | null} Active text card's getBoundingClientRect; null when no active text card (title card, full-object mode). Populated by card-pool.js on activation + layout-mode.js on layoutchange. */
     cardOverlayRect: null,
-    // ── Mobile button navigation ─────────────────────────────────────────────
-    /** Index of the current step in mobile/embed button mode. */
-    currentMobileStep: 0,
-    /** Whether mobile navigation is showing the intro card (before step 0). */
-    mobileInIntro: false,
+    // ── Button navigation ────────────────────────────────────────────────────
+    /** Index of the current step in button navigation. */
+    currentButtonStep: 0,
+    /** Whether button navigation is showing the intro card (before step 0). */
+    buttonInIntro: false,
     /** References to the prev/next button DOM elements. */
-    mobileNavButtons: null,
-    /** Whether mobile navigation is in its cooldown period. */
-    mobileNavigationCooldown: false,
+    buttonNavButtons: null,
+    /** Whether button navigation is in its cooldown period. */
+    buttonNavCooldown: false,
     // ── Connection speed ─────────────────────────────────────────────────────
     /** @type {number[]} Measured manifest fetch times (ms) for threshold tuning. */
     manifestLoadTimes: [],
     /**
      * Map of sceneIndex -> Plate, one per scene, built once and never evicted.
      * `.container` is the element. What a plate holds — a viewer, a player,
-     * nothing yet — is the plate's own business; the pool inside an image
+     * nothing yet — is the plate's own business; the viewer pool inside an image
      * plate is the only thing here that is capped.
      */
     viewerPlates: {},
@@ -160,8 +166,8 @@
     titleCards: {},
     /** Index of the currently active title card step, or null when none is active. */
     activeTitleCardIndex: null,
-    /** Current object run tracking (for peek stack positioning). */
-    currentObjectRun: { objectId: null, runPosition: 0 },
+    /** The scene of the current object, and the card's position in it (for peek stack positioning). */
+    currentObjectScene: { objectId: null, scenePosition: 0 },
     // ── Scene maps (populated at initCardPool time) ───────────────────────────
     /**
      * Filtered step data (metadata rows removed), in the same index space as
@@ -180,7 +186,7 @@
     totalScenes: 0,
     // ── Viewer preloading config (set from telarConfig in main.js) ───────────
     config: {
-      /** Maximum IIIF wrapper instances kept in memory (per-scene pool cap). */
+      /** Maximum IIIF wrapper instances kept in memory (viewer pool cap). */
       maxViewerCards: 8,
       /** Steps to preload ahead of the current position. */
       preloadSteps: 6,
@@ -403,7 +409,7 @@
     /**
      * @param {IiifViewerOptions} options
      */
-    constructor({ container, manifestUrl, startPage = 0, showChrome = false, allowZoomGestures = false }) {
+    constructor({ container, manifestUrl, startPage = 0, showChrome = false, allowZoomGestures = false, onPageShown = null }) {
       if (!window.OpenSeadragon) {
         throw new Error("IiifViewer: window.OpenSeadragon not loaded \u2014 vendor <script> ordering issue?");
       }
@@ -415,6 +421,7 @@
       this.startPage = startPage;
       this.showChrome = showChrome;
       this.allowZoomGestures = allowZoomGestures;
+      this._onPageShown = onPageShown;
       this.pages = [];
       this.currentPage = startPage;
       this.viewer = null;
@@ -456,9 +463,10 @@
           this.viewer.gestureSettingsMouse.clickToZoom = false;
         }
         await new Promise((resolve, reject) => {
-          const onFirstOpen = () => {
+          const onFirstOpen = (event) => {
             this.viewer.removeHandler("open", onFirstOpen);
             this.viewer.removeHandler("open-failed", onOpenFailed);
+            this._reportPageShown(event);
             requestAnimationFrame(resolve);
           };
           const onOpenFailed = (event) => {
@@ -469,9 +477,10 @@
           this.viewer.addHandler("open", onFirstOpen);
           this.viewer.addHandler("open-failed", onOpenFailed);
         });
-        this.viewer.addHandler("open", () => {
+        this.viewer.addHandler("open", (event) => {
           this._pageTransitioning = false;
           this._updateChrome();
+          this._reportPageShown(event);
         });
         this.viewer.addHandler("open-failed", () => {
           this._pageTransitioning = false;
@@ -500,6 +509,22 @@
       this._pageTransitioning = true;
       this.viewer.open(this.pages[n].tileSource);
       this._updateChrome();
+    }
+    /**
+     * Tell the `onPageShown` caller which page an OSD 'open' event showed.
+     *
+     * OpenSeadragon 6.0.2 drops an open superseded by a later `setPage`
+     * without raising 'open' for it, so after two quick page changes the only
+     * 'open' is the later page's. The source check keeps the report tied to
+     * the page asked for last should an 'open' arrive for any other source.
+     *
+     * @param {{source?: *}} [event] - OSD 'open' event.
+     */
+    _reportPageShown(event) {
+      if (!this._onPageShown || this._destroyed) return;
+      const page = this.pages[this.currentPage];
+      if (!page || !event || event.source !== page.tileSource) return;
+      this._onPageShown(this.currentPage);
     }
     /**
      * Tear down the viewer and remove injected chrome.
@@ -687,17 +712,45 @@
     if (data.objectId) return data.baseUrl + "/iiif/objects/" + data.objectId + "/manifest.json";
     return null;
   }
+  function requestedPage(search) {
+    const value = new URLSearchParams(search).get("page");
+    if (value === null || !/^[0-9]+$/.test(value)) return 0;
+    const page = parseInt(value, 10);
+    return page >= 1 ? page - 1 : 0;
+  }
+  function addressWithPage(href, page0, total) {
+    const url = new URL(href);
+    const pieces = url.search.replace(/^\?/, "").split("&");
+    const isPage = function(piece) {
+      return piece !== "" && Array.from(new URLSearchParams(piece).keys())[0] === "page";
+    };
+    const named = total > 1 && page0 > 0;
+    if (!named && !pieces.some(isPage)) return href;
+    const kept = pieces.filter(function(piece) {
+      return piece !== "" && !isPage(piece);
+    });
+    if (named) kept.push("page=" + (page0 + 1));
+    url.search = kept.length ? "?" + kept.join("&") : "";
+    return url.href;
+  }
   async function initImageViewer(data, doc = document) {
     const manifestUrl = manifestUrlFor(data);
     if (!manifestUrl) {
       console.error("No IIIF source specified");
       return;
     }
+    const win = doc.defaultView || window;
+    function writeAddress(page0) {
+      const next = addressWithPage(win.location.href, page0, wrapper.pages.length);
+      if (next !== win.location.href) win.history.replaceState(win.history.state, "", next);
+    }
     const wrapper = new IiifViewer({
       container: "#object-viewer",
       manifestUrl,
+      startPage: requestedPage(win.location.search),
       showChrome: true,
-      allowZoomGestures: true
+      allowZoomGestures: true,
+      onPageShown: writeAddress
     });
     try {
       await wrapper.ready;
@@ -706,6 +759,7 @@
       return;
     }
     const isMultiPage = wrapper.pages.length > 1;
+    writeAddress(wrapper.currentPage);
     if (isMultiPage) {
       doc.getElementById("object-viewer").classList.add("multipage");
       const pageRows = doc.querySelectorAll(".coord-page-row");

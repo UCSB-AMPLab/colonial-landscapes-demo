@@ -17,8 +17,8 @@ import yaml
 from telar.widgets import process_widgets
 from telar.images import process_images
 from telar.glossary import process_glossary_links, load_glossary_terms
-from telar.latex import convert_markdown
-from telar.frontmatter import FRONTMATTER_PATTERN
+from telar.markdown import render_markdown
+from telar.frontmatter import FRONTMATTER_LOAD_ERRORS, FRONTMATTER_PATTERN
 
 
 # Front-matter keys a page source does not get to decide. A page's URL comes
@@ -81,7 +81,7 @@ def _parse_page_frontmatter(source_file):
 
     try:
         frontmatter_dict = yaml.safe_load(frontmatter_text) or {}
-    except yaml.YAMLError as e:
+    except FRONTMATTER_LOAD_ERRORS as e:
         print(f"❌ Error: Invalid YAML frontmatter in {source_file}: {e}")
         return None
 
@@ -127,7 +127,7 @@ def check_title_keys(root='.'):
     return warnings
 
 
-def generate_pages(telar_language='en'):
+def generate_pages(telar_language='en', glossary_terms=None):
     """Generate processed page files from user markdown sources.
 
     Reads from telar-content/texts/pages/*.md, processes widgets and glossary links,
@@ -139,6 +139,9 @@ def generate_pages(telar_language='en'):
     in place of the canonical file but is output under the canonical filename
     (so the URL is the same in both languages). Sister files for other
     languages are skipped.
+
+    `glossary_terms` is the link map the caller has already loaded
+    (`generate_glossary()` returns it); read here when omitted.
     """
     source_dir = Path('telar-content/texts/pages')
     output_dir = Path('_jekyll-files/_pages')
@@ -156,7 +159,8 @@ def generate_pages(telar_language='en'):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load glossary terms for link processing
-    glossary_terms = load_glossary_terms()
+    if glossary_terms is None:
+        glossary_terms = load_glossary_terms()
 
     # Pass 1: separate canonical pages from localized sisters and build a sister map
     canonicals = []  # list of source files
@@ -203,14 +207,13 @@ def generate_pages(telar_language='en'):
         # 2. Process images (size syntax and captions)
         processed = process_images(processed)
 
-        # 3. Convert markdown to HTML
-        processed = convert_markdown(
-            processed,
-            extensions=['extra', 'nl2br', 'sane_lists']
-        )
-
-        # 4. Process glossary links ([[term]] syntax)
-        processed = process_glossary_links(processed, glossary_terms, warnings_list)
+        # 3. Convert markdown to HTML, with glossary links ([[term]] syntax)
+        # made while maths is held out of the HTML
+        processed = render_markdown(
+            processed, str(source_file),
+            post_process=lambda rendered: process_glossary_links(
+                rendered, glossary_terms, warnings_list),
+            extra_extensions=('sane_lists',))
 
         # Print any warnings
         for warning in warnings_list:

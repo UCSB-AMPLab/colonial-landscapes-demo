@@ -27,12 +27,11 @@ Each widget type has its own parser:
   `baseurl`. The carousel template only ever renders `item.src` — it
   carries no URL logic of its own.
 
-  The base URL is read here rather than left as a Liquid token because the
-  two render paths do not treat such a token alike. A widget in a page is
-  rendered by Jekyll and would resolve it; a widget in a story reaches the
-  browser through `story.html`'s `jsonify`, which serialises strings without
-  re-parsing Liquid inside them, so the token arrived at the reader verbatim.
-  Resolving in Python is what makes both paths produce the same URL.
+  The base URL is read here rather than left as a Liquid token because a
+  widget in a story reaches the browser through `story.html`'s `jsonify`,
+  which serialises strings without resolving Liquid inside them, while a
+  widget in a page is rendered by Jekyll. Resolving in Python gives both
+  paths the same URL.
 
 - `parse_tabs_widget()` and `parse_accordion_widget()` both use
   `parse_markdown_sections()` to split content on `## ` headers into
@@ -196,12 +195,7 @@ def declared_dimensions(item):
 
 # The site's own prefix, for turning an author's bare filename into a path a
 # browser can fetch. Read from _config.yml rather than emitted as a Liquid
-# token: a widget in a page is rendered by Jekyll and would resolve such a
-# token, but a widget in a story reaches the browser through story.html's
-# `jsonify`, which serialises strings without re-parsing Liquid inside them.
-# The same carousel therefore worked in one place and published a literal
-# "{{ site.baseurl }}" in the other. Resolving here is what makes the two
-# paths the same path.
+# token (see the module docstring).
 _BASE_URL_UNSET = object()
 _cached_base_url = _BASE_URL_UNSET
 
@@ -324,8 +318,7 @@ def parse_carousel_widget(content, file_path, warnings_list, base_url=None):
         for field in ('caption', 'credit'):
             if field in data:
                 data[field] = convert_markdown(
-                    data[field], post_process=_caption_html,
-                    restore_as_text=True)
+                    data[field], post_process=_caption_html)
 
         items.append(data)
 
@@ -400,8 +393,7 @@ def parse_markdown_sections(content, footnote_scope=None):
     for number, section in enumerate(sections, 1):
         content_text = '\n'.join(section['content']).strip()
         section['content_html'] = convert_markdown(
-            content_text, extensions=['extra', 'nl2br'],
-            footnote_scope=_section_scope(footnote_scope, number))
+            content_text, footnote_scope=_section_scope(footnote_scope, number))
 
     return sections
 
@@ -522,8 +514,7 @@ def parse_bibliography_widget(content, file_path, warnings_list, widget_id=None)
         if not block:
             continue
         html = convert_markdown(
-            block, extensions=['extra', 'nl2br'],
-            footnote_scope=_section_scope(widget_id, len(entries) + 1))
+            block, footnote_scope=_section_scope(widget_id, len(entries) + 1))
         entries.append({'content_html': html})
 
     if not entries:
@@ -635,7 +626,7 @@ def render_widget_html(widget_type, widget_data, widget_id):
 def process_widgets(text, file_path, warnings_list):
     """
     Find and process :::widget::: blocks in markdown text.
-    Must be called BEFORE the text is converted to HTML.
+    Must be called before the text is converted to HTML.
 
     Args:
         text: Raw markdown text

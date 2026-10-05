@@ -161,7 +161,7 @@ index_page:
 
     Tres formas de empezar:
 
-    - **Sin código:** configura y gestiona tu sitio desde una interfaz visual con el **[Telar Compositor](https://compositor.telar.org)**
+    - **Sin código:** configura y gestiona tu sitio desde una interfaz visual con el **[Compositor de Telar](https://compositor.telar.org)**
     - **Asistida:** copia la **[plantilla de GitHub](https://github.com/UCSB-AMPLab/telar)** y edita tu contenido en Google Sheets
     - **Manual:** clona la plantilla y edita los archivos CSV y markdown localmente
 
@@ -358,11 +358,12 @@ errors:
 
     # Errores de enlaces al glosario
     glossary_term_not_found: "la entrada '<strong>{{ term_id }}</strong>' no existe en el glosario. Revisa que coincida con el <code>term_id</code> de una fila de tu hoja de cálculo del glosario o de un archivo de <code>telar-content/texts/glossary/</code>."
+    glossary_term_in_link_text: "la entrada '<strong>{{ term_id }}</strong>' está dentro del texto de un enlace, así que se muestra como texto normal y no abre el glosario. Sácala del enlace para que abra el glosario."
 
     # Límites de la respuesta de un paso
     answer_image_dropped: "En `{{ story }}` quitamos una imagen o un elemento incrustado de la respuesta del paso {{ step }}. La respuesta de un paso es texto corrido: pon ese contenido en un panel o conviértelo en el objeto del paso."
     answer_widget_dropped: "En `{{ story }}` quitamos los widgets (los bloques que empiezan con `:::`) de la respuesta del paso {{ step }}. La respuesta de un paso es texto corrido: pasa esos widgets a un panel."
-    answer_over_hard_limit: "La respuesta del paso {{ step }} de `{{ story }}` tiene {{ count }} palabras y la recortamos a {{ limit }}. El texto que sobra no aparece en la historia. Acorta la respuesta o pasa los detalles a un panel."
+    answer_over_hard_limit: "La respuesta del paso {{ step }} de `{{ story }}` es demasiado larga y no cabe en la tarjeta de la historia. Una respuesta puede tener hasta {{ max_paragraphs }} párrafos y {{ limit }} líneas; contamos 53 caracteres por línea y dos líneas más por cada párrafo después del primero. Esta tiene {{ lines }} líneas. La recortamos para que quepa, así que el texto que sobra no aparece en la historia. Acorta la respuesta o pasa los detalles a un panel."
     answer_footnotes_dropped: "En `{{ story }}` quitamos las notas al pie de la respuesta del paso {{ step }}, tanto el número como el texto de la nota. La respuesta de un paso es texto corrido: pasa la nota a un panel o di en la misma frase lo que decía."
     answer_markup_flattened: "En `{{ story }}` simplificamos la respuesta del paso {{ step }}: las listas, los títulos y las citas conservan las palabras y pierden el formato; las tablas, los bloques de código y las líneas divisorias desaparecen por completo. La respuesta de un paso es texto corrido: pasa ese contenido a un panel, donde se ve tal como lo escribiste."
 
@@ -423,8 +424,6 @@ share:
   protected_embed_warning: "Esta historia está protegida. El contenido insertado estará bloqueado hasta que se ingrese la clave."
   copy_manually: "Copia el texto a mano"
   copied: "Copiado al portapapeles"
-
-  # Claves heredadas (mantenidas por compatibilidad)
 
 # Pantalla de desbloqueo de historias protegidas
 unlock:

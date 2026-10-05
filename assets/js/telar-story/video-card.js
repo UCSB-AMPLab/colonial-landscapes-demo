@@ -44,17 +44,12 @@
  */
 
 import { state } from './state.js';
-import { readBelow } from './media-arrangement.js';
+import { readBelow, readTopBand } from './media-arrangement.js';
 
-// Layout and embed arithmetic, in video-layout.js. Used here, and re-exported
-// so the plates and the tests import it from this module as before.
+// Layout and embed arithmetic, in video-layout.js.
 import {
   computeVideoLayout, computeVideoLetterboxRegion,
   buildYouTubeEmbedConfig, buildGDriveEmbedUrl,
-} from './video-layout.js';
-export {
-  computeVideoLayout, computeVideoLetterboxRegion,
-  buildYouTubeEmbedConfig, buildGDriveEmbedUrl, formatClipTime,
 } from './video-layout.js';
 
 // ── Module-level player pool ──────────────────────────────────────────────────
@@ -109,7 +104,7 @@ export function loadYouTubeAPI() {
  * blocked). The maxresdefault thumbnail is the only signal that reflects the
  * real source aspect — but it 404s for old/low-res uploads, and the smaller
  * thumbnails are letterbox-padded (hqdefault/default to 4:3) or cropped
- * (mqdefault to 16:9), so they cannot be trusted. We therefore probe ONLY
+ * (mqdefault to 16:9), so they cannot be trusted. We therefore probe only
  * maxresdefault via an Image (no CORS issue for naturalWidth/Height) and
  * resolve null when it is missing, leaving the caller to fall back to a dark
  * letterbox frame.
@@ -387,7 +382,7 @@ export function activateVideoCard(plateEl, sceneIndex) {
  */
 export function deactivateVideoCard(plateEl) {
   plateEl.classList.remove('is-active');
-  // NOTE: does NOT touch transform — caller decides positioning
+  // Leaves the transform alone — the caller decides positioning
   // (forward nav: plate stays put, covered by incoming plate;
   //  backward nav: caller sets translateY(100%) to slide it away)
 
@@ -767,8 +762,8 @@ function _evictPlayer(wrapper) {
   // than appending a second container beside the first. What each provider's
   // teardown removes differs — YouTube's destroy() takes the iframe carrying
   // the class, Vimeo's leaves the container div that holds it — so the plate
-  // is cleared here rather than relied on above. Same contract card-pool.js's
-  // _evictOsdInstance keeps for .viewer-instance.
+  // is cleared here rather than relied on above. IiifPlate.unload keeps the
+  // same contract for .viewer-instance.
   wrapper.element?.querySelector('.video-iframe')?.remove();
 }
 
@@ -815,13 +810,14 @@ function _applyVideoLayout(plateEl) {
   const videoEl = plateEl.querySelector('.video-iframe');
   if (!videoEl) return;
   const below = readBelow(plateEl);
+  const topBand = readTopBand(plateEl);
 
   // Unknown-aspect path: when the true aspect ratio could not be determined
   // (old YouTube videos without a maxres thumbnail; all Google Drive embeds),
   // fill the whole available region on a dark frame and let the provider's
   // player letterbox the video itself, instead of guessing an aspect ratio.
   if (plateEl.dataset.videoLetterbox === 'true') {
-    const region = computeVideoLetterboxRegion(W, H, below);
+    const region = computeVideoLetterboxRegion(W, H, below, topBand);
     videoEl.classList.add('video-iframe--letterbox');
     videoEl.style.position = 'absolute';
     videoEl.style.left = `${region.left}px`;
@@ -836,7 +832,7 @@ function _applyVideoLayout(plateEl) {
   // succeeded). Default 16:9 only as a last resort.
   videoEl.classList.remove('video-iframe--letterbox');
   const aspectRatio = parseFloat(plateEl.dataset.aspectRatio) || 16 / 9;
-  const layout = computeVideoLayout(W, H, aspectRatio, below);
+  const layout = computeVideoLayout(W, H, aspectRatio, below, topBand);
   videoEl.style.position = 'absolute';
   videoEl.style.left = `${layout.video.left}px`;
   videoEl.style.top = `${layout.video.top}px`;
@@ -846,7 +842,7 @@ function _applyVideoLayout(plateEl) {
 
 /**
  * Re-place a plate's player once its video's aspect is known, and tell the
- * card pool, which compares the arrangement at that aspect.
+ * card stack, which compares the arrangement at that aspect.
  */
 function _aspectLearned(plateEl) {
   _applyVideoLayout(plateEl);

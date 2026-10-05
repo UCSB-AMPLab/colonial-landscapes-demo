@@ -20,13 +20,19 @@ pipeline. Files are expected under `telar-content/texts/`.
 cells. It normalises line endings (spreadsheets may use `\\r\\n` or
 `\\r`), checks for optional YAML frontmatter (only treated as frontmatter
 if it contains a `title:` key, to avoid false matches with `---` used
-as horizontal rules), and then runs the same pipeline. The markdown
-library's `nl2br` extension is enabled so that single line breaks in
-the spreadsheet cell produce `<br>` tags in the output.
+as horizontal rules), and then runs the same pipeline.
+
+`render_markdown()` is the conversion every whole body of author text goes
+through -- panels, step answers, pages and glossary pages: it closes any
+HTML container the text leaves open, then converts with
+`telar.latex.convert_markdown`, whose extensions (`extra`, `nl2br`,
+`smarty`) are the same for every conversion, so a single line break is a
+line break and quotes and ellipses are typographic wherever an author
+writes them.
 
 Content trust model (raw-HTML pass-through is intentional)
 ----------------------------------------------------------
-Markdown is converted WITHOUT an HTML sanitiser, so raw HTML
+Markdown is converted without an HTML sanitiser, so raw HTML
 embedded in author markdown/CSV content passes straight through to the
 rendered page. This is by design: Telar is a minimal-computing static-site
 framework whose content is authored by trusted contributors (the same
@@ -47,13 +53,15 @@ Version: v1.8.0
 
 import re
 
+import markdown
 import yaml
+from markdown.extensions.md_in_html import HTMLExtractorExtra
 
+from telar.frontmatter import FRONTMATTER_LOAD_ERRORS, FRONTMATTER_PATTERN
 from telar.images import process_images, resolve_path_case_insensitive
-from telar.latex import convert_markdown
+from telar.latex import MARKDOWN_EXTENSIONS, convert_markdown, protect_latex
 from telar.widgets import process_widgets
 
-FRONTMATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n(.*)$', re.DOTALL)
 # Anchored, because `subtitle:` ends in `title:` and an unanchored search
 # matches inside it. A top-level YAML key sits at column 0, so no leading
 # whitespace is allowed either: an indented `title:` belongs to the mapping
@@ -77,17 +85,15 @@ def _split_frontmatter(content, source='content'):
     visible YAML on the page, where its author can see it, while content
     mistaken for front matter simply disappears.
 
-    A block that does parse as a YAML mapping and still has no title is the
-    case that is now shown rather than swallowed, so it is worth saying so
-    — otherwise its author sees their metadata on the page and no reason
-    for it. Ordinary prose under a rule does not parse as a mapping and so
-    says nothing, which is the common case and stays quiet.
+    A block that does parse as a YAML mapping and has no title is kept as
+    content and warned about, so its author sees why their metadata appears
+    on the page. Ordinary prose under a rule does not parse as a mapping and
+    says nothing.
 
-    A single prose line containing a colon does parse as a mapping, so it
-    is warned about when it was only ever a sentence. That is the right
-    direction for the warning to be wrong in: it is advisory, the text is
-    kept either way, and the remedy it suggests — separate the block from
-    the text below it — is good advice for a line that ambiguous.
+    A single prose line containing a colon does parse as a mapping, so it is
+    warned about too. The warning is advisory, the text is kept either way,
+    and the remedy it suggests — separate the block from the text below it —
+    is good advice for a line that ambiguous.
 
     Args:
         content: Raw text that may begin with a `---`-delimited frontmatter block
@@ -120,7 +126,7 @@ def _split_frontmatter(content, source='content'):
     # whatever is between them untouched, backslashes included.
     try:
         parsed = yaml.safe_load(frontmatter_text)
-    except yaml.YAMLError:
+    except FRONTMATTER_LOAD_ERRORS:
         parsed = None
 
     if isinstance(parsed, dict) and 'title' in parsed:
@@ -130,8 +136,8 @@ def _split_frontmatter(content, source='content'):
         # A title is text, and YAML types it: `yes` is a boolean, `~` and
         # `null` are null, `[a]` a list. `str()` on those puts a Python
         # literal on the page -- `True`, `None`, `['a']` -- which is neither
-        # what the author typed nor anything they can search for. The gate
-        # has already matched the line, so its reading is the text as typed.
+        # what the author typed nor anything they can search for. The title
+        # pattern has already matched the line, so its reading is the text as typed.
         return title_match.group(1).strip(), body
 
     print(f"  Warning: {source}'s front matter could not be parsed as "
@@ -147,39 +153,104 @@ def _looks_like_metadata(block):
     """
     try:
         return isinstance(yaml.safe_load(block), dict)
-    except yaml.YAMLError:
+    except FRONTMATTER_LOAD_ERRORS:
         return False
 
 
-def _process_pipeline(body, widget_source, widget_warnings):
+def _unclosed_html_blocks(body):
+    """Tags the Markdown library's HTML block pass leaves open at the end of *body*.
+
+    The answer comes from the library's own parser, fed the way its
+    html_block preprocessor feeds it: after the preprocessors that run
+    before it, so a tag inside a fenced code block is code and is not
+    counted. The tags come back outermost first. Left open, Python Markdown
+    closes only to the nearest tag of the same name, and two nested
+    containers of one name lose the outer one's text.
+
+    LaTeX is held out first, as convert_markdown does, so a `<div>` inside
+    a formula is not read as a tag.
+    """
+    protected, _ = protect_latex(body)
+    md = markdown.Markdown(extensions=list(MARKDOWN_EXTENSIONS))
+    html_block = md.preprocessors['html_block']
+    lines = protected.split('\n')
+    for preprocessor in md.preprocessors:
+        if preprocessor is html_block:
+            break
+        lines = preprocessor.run(lines)
+    parser = HTMLExtractorExtra(md)
+    parser.feed('\n'.join(lines))
+    return list(parser.mdstack)
+
+
+def _close_html_blocks(body, source):
+    """Append the closing tags *body* is missing, and warn once.
+
+    Author text is never dropped: the result renders as *body* would if its
+    author had closed every container at the end, innermost first. Text
+    that closes everything it opens is returned as it is.
+    """
+    unclosed = _unclosed_html_blocks(body)
+    if not unclosed:
+        return body
+    opened = ', '.join(f'<{tag}>' for tag in unclosed)
+    closers = ''.join(f'</{tag}>' for tag in reversed(unclosed))
+    pronoun = 'it' if len(unclosed) == 1 else 'them'
+    where = 'inline content' if source == 'inline-content' else source
+    print(f"  Warning: {where} opens {opened} and does not close {pronoun}. "
+          f"The build closes {pronoun} at the end of the text; add {closers} "
+          f"where the text should end.")
+    return body + '\n' + closers
+
+
+def render_markdown(body, source='inline-content', post_process=None,
+                    extra_extensions=()):
+    """*body*, a whole piece of author markdown, as HTML.
+
+    Containers *body* leaves open are closed at its end, with a warning
+    naming *source*, and the text is converted by `convert_markdown`.
+    *post_process* receives the HTML while maths is still a placeholder:
+    whatever reads or rewrites the rendered HTML -- glossary links, an
+    answer's flattening and cut -- runs there. *extra_extensions* are
+    Python Markdown extensions a caller needs beyond the shared ones.
+
+    Raw HTML passes through unsanitised by design (trusted-author model) --
+    see the module docstring.
+    """
+    body = _close_html_blocks(body, source)
+    return convert_markdown(body, post_process=post_process,
+                            extra_extensions=extra_extensions)
+
+
+def _process_pipeline(body, widget_source, widget_warnings, post_process=None):
     """
     Run the widget/image/markdown pipeline shared by file-based and inline
-    panel content: process_widgets -> process_images -> convert_markdown
-    (extensions=['extra', 'nl2br']).
-
-    Raw HTML passes through unsanitised by design (trusted-author model) —
-    see the module docstring.
+    panel content: process_widgets -> process_images -> render_markdown.
 
     Args:
         body: Markdown text to process
         widget_source: Identifier passed to process_widgets (file_path or 'inline-content')
         widget_warnings: List to collect widget warnings
+        post_process: Optional callable given the rendered HTML (see
+            render_markdown)
 
     Returns:
         str: Rendered HTML
     """
     body = process_widgets(body, widget_source, widget_warnings)
     body = process_images(body)
-    return convert_markdown(body, extensions=['extra', 'nl2br'])
+    return render_markdown(body, widget_source, post_process)
 
 
-def read_markdown_file(file_path, widget_warnings=None):
+def read_markdown_file(file_path, widget_warnings=None, post_process=None):
     """
     Read a markdown file and parse frontmatter
 
     Args:
         file_path: Path to markdown file relative to telar-content/texts/
         widget_warnings: Optional list to collect widget warnings
+        post_process: Optional callable given the rendered HTML (see
+            render_markdown)
 
     Returns:
         dict with 'title' and 'content' keys, or None if file doesn't exist
@@ -199,7 +270,7 @@ def read_markdown_file(file_path, widget_warnings=None):
             content = f.read()
 
         title, body = _split_frontmatter(content, source=file_path)
-        html_content = _process_pipeline(body, file_path, widget_warnings)
+        html_content = _process_pipeline(body, file_path, widget_warnings, post_process)
 
         return {
             'title': title,
@@ -211,7 +282,7 @@ def read_markdown_file(file_path, widget_warnings=None):
         return None
 
 
-def process_inline_content(text, widget_warnings=None):
+def process_inline_content(text, widget_warnings=None, post_process=None):
     """
     Process inline panel content (text written directly in spreadsheet).
 
@@ -222,6 +293,8 @@ def process_inline_content(text, widget_warnings=None):
     Args:
         text: Raw text from spreadsheet cell
         widget_warnings: Optional list to collect widget warnings
+        post_process: Optional callable given the rendered HTML (see
+            render_markdown)
 
     Returns:
         dict with 'title' and 'content' (HTML) keys
@@ -237,7 +310,8 @@ def process_inline_content(text, widget_warnings=None):
 
     title, content = _split_frontmatter(content, source='inline content')
 
-    html_content = _process_pipeline(content, 'inline-content', widget_warnings)
+    html_content = _process_pipeline(content, 'inline-content', widget_warnings,
+                                     post_process)
 
     return {
         'title': title,

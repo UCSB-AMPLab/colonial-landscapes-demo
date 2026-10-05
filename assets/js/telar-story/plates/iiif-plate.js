@@ -5,15 +5,13 @@
  * external manifest. The default: a step with an object, no video URL and no
  * audio file is this.
  *
- * The instance is the viewer card. `iiif-card.js` frames a viewer by taking a
- * record with `element`, `osdViewer`, `isReady` and `pendingZoom` on it, and
- * this carries those itself rather than holding a second object that does —
- * which is what a separate, capped `viewerCards` array made of it before. The
- * plate is the permanent thing; the viewer inside it is the evictable one, and
- * `load` / `unload` are that boundary.
+ * `iiif-card.js` frames a viewer by taking a record with `element`,
+ * `osdViewer`, `isReady` and `pendingZoom` on it, and the plate carries those
+ * itself. The plate is the permanent thing; the viewer inside it is the
+ * evictable one, and `load` / `unload` are that boundary.
  *
- * `element` is an alias for `container`. Both names are load-bearing: the base
- * class and the card pool say `container`, and `iiif-card.js` says `element`.
+ * `element` is an alias for `container`: the base class and the card stack
+ * read `container`, and `iiif-card.js` reads `element`.
  *
  * @version v1.8.0
  */
@@ -22,7 +20,7 @@ import { Plate } from './base-plate.js';
 import { state } from '../state.js';
 import { IiifViewer } from '../iiif-viewer.js';
 import { getManifestUrl } from '../viewer.js';
-import { snapIiifToPosition, animateIiifToPosition } from '../iiif-card.js';
+import { snapIiifToPosition, animateIiifToPosition, stopCameraMove } from '../iiif-card.js';
 import { FULL_OBJECT_FRAMING, stepFraming } from './framing.js';
 
 /** Unique ids for the div OSD mounts into, one per viewer ever built. */
@@ -53,7 +51,7 @@ export class IiifPlate extends Plate {
     /** A framing queued while the viewer was not ready yet. */
     this.pendingZoom = null;
     /** The framing last written at rest, so it is written once per arrival. */
-    this.settledAt = null;
+    this.restingAt = null;
   }
 
   /** The plate element, under the name `iiif-card.js` reads it by. */
@@ -74,14 +72,14 @@ export class IiifPlate extends Plate {
 
   /** Free the viewer and its GPU memory; the plate element stays in the DOM. */
   unload() {
-    if (this.osdWrapper && typeof this.osdWrapper.destroy === 'function') {
-      this.osdWrapper.destroy();
-    }
+    // A move animating the viewer being freed would write to the next one.
+    stopCameraMove(this);
+    this.osdWrapper?.destroy();
     this.osdWrapper = null;
     this.osdViewer = null;
     this.isReady = false;
     this.pendingZoom = null;
-    this.settledAt = null;
+    this.restingAt = null;
 
     // Take the mount point with it, so a later load builds cleanly rather
     // than into the div the dead viewer left.
@@ -92,7 +90,7 @@ export class IiifPlate extends Plate {
   /**
    * Bring the plate's viewer to a step, building it if it has none.
    *
-   * The card pool has already moved the element; what is left is the viewer
+   * The card stack has already moved the element; what is left is the viewer
    * inside it. Snapped rather than animated, because a plate arriving is not
    * panning across an image the reader is already looking at.
    *
@@ -125,7 +123,6 @@ export class IiifPlate extends Plate {
     if (state.scrollDriven && !snap) return;
 
     const { x, y, zoom } = stepFraming(step);
-    if (isNaN(x) || isNaN(y) || isNaN(zoom)) return;
 
     if (!this.isReady) {
       this.pendingZoom = { x, y, zoom, snap };
@@ -141,7 +138,7 @@ export class IiifPlate extends Plate {
   /**
    * The div OSD mounts into.
    *
-   * A plate evicted from the pool keeps its own element but loses this child,
+   * A plate whose viewer was evicted keeps its own element but loses this child,
    * so re-entering the scene builds a fresh one. A plate that still has one is
    * given the new viewer's id rather than a second div.
    *
@@ -160,20 +157,6 @@ export class IiifPlate extends Plate {
     viewerDiv.id = viewerId;
     this.container.appendChild(viewerDiv);
     return viewerDiv;
-  }
-
-  /**
-   * The framing a viewer opens at, or null when the step authored none.
-   *
-   * Snapping rather than animating, because there is nothing yet on screen to
-   * animate from.
-   *
-   * @param {{x: number, y: number, zoom: number}} framing
-   * @returns {{ x: number, y: number, zoom: number, snap: boolean }|null}
-   */
-  static _openingFraming({ x, y, zoom }) {
-    if (isNaN(x) || isNaN(y) || isNaN(zoom)) return null;
-    return { x, y, zoom, snap: true };
   }
 
   _build(step) {
@@ -206,18 +189,22 @@ export class IiifPlate extends Plate {
     this.osdWrapper = osdWrapper;
     this.osdViewer = null;
     this.isReady = false;
-    this.pendingZoom = IiifPlate._openingFraming({ x, y, zoom });
+    // The opening framing snaps rather than animates: nothing is on screen yet
+    // to animate from.
+    this.pendingZoom = { x, y, zoom, snap: true };
 
     osdWrapper.ready.then(() => {
       this.osdViewer = osdWrapper.viewer;
       this.isReady = true;
       delete plateEl.dataset.loading;
 
-      // Belt-and-braces: the wrapper already sets this in _init(); keeping
-      // the line here documents the Telar invariant (wheel events belong to
-      // Lenis, not OSD) at the call site too.
-      osdWrapper.viewer.gestureSettingsMouse.scrollToZoom = false;
+      // The reader taking the image stops a move animating it, so the two
+      // never write the viewer at once.
+      const stop = () => stopCameraMove(this);
+      osdWrapper.viewer.addHandler('canvas-press', stop);
+      osdWrapper.viewer.addHandler('canvas-pinch', stop);
 
+      // An unload while the viewer was building cleared the framing.
       if (!this.pendingZoom) return;
 
       const pz = this.pendingZoom;
@@ -237,11 +224,11 @@ export class IiifPlate extends Plate {
   /**
    * Re-apply the opening framing if the viewer's home fit overwrote it.
    *
-   * Belt-and-braces on top of the rAF-deferred `.ready`: a residual race can
-   * still leave the viewer at home zoom. One frame after the apply, compare
-   * the current zoom against home; matching — with an authored zoom
-   * meaningfully above it — means the apply was dropped. Tolerance is 5% of
-   * home zoom, and the re-apply happens exactly once.
+   * A second check on top of the rAF-deferred `.ready`: the viewer can still
+   * end up at home zoom. One frame after the apply, compare the current zoom
+   * against home; matching — with an authored zoom meaningfully above it —
+   * means the apply was dropped. Tolerance is 5% of home zoom, and the
+   * re-apply happens exactly once.
    *
    * `pendingZoom` is cleared only afterwards, so the values are still there
    * for the re-apply if it is needed.
