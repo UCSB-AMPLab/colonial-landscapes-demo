@@ -4,8 +4,8 @@ title: Home
 title_key: navigation.home
 ---
 
-Este sitio es una reconstrucción en [Telar](https://telar.org), un marco de computación mínima que entreteje imágenes IIIF, audio, video y textos en narrativas visuales por capas. Telar está basado en el formato narrativo de *Paisajes coloniales*.
+This site rebuilds *Colonial Landscapes* in [Telar](https://telar.org), a minimal computing framework that weaves IIIF images, audio, video, and text into layered visual narratives. Telar's narrative format comes from *Colonial Landscapes*.
 
-[*Paisajes coloniales: redibujando los territorios andinos en el siglo XVII*](https://paisajescoloniales.com) es un proyecto de Santiago Muñoz Arbeláez (investigación y dirección general del proyecto), con Adelaida Ávila Cabrera (diseño y producción) y María Alejandra Orduz Avella (coordinación y desarrollo de recursos pedagógicos).
+[*Colonial Landscapes: Redrawing Andean Territories in the Seventeenth Century*](https://colonial-landscapes.com) is a project by Santiago Muñoz Arbeláez (research and direction), with Adelaida Ávila Cabrera (design and production) and María Alejandra Orduz Avella (coordination and development of learning resources).
 
-El sitio original está en [paisajescoloniales.com](https://paisajescoloniales.com).
+The original site is at [colonial-landscapes.com](https://colonial-landscapes.com).
