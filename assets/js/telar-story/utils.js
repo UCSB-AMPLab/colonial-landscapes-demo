@@ -29,8 +29,10 @@ export { escapeHtml } from '../objects-filter/escape.js';
  */
 export function getBasePath() {
   const pathParts = window.location.pathname.split('/').filter(p => p);
-  const prefix = pathParts.slice(0, -2);
-  return prefix.length > 0 ? '/' + prefix.join('/') : '';
+  if (pathParts.length >= 2) {
+    return '/' + pathParts.slice(0, -2).join('/');
+  }
+  return '';
 }
 
 /**
