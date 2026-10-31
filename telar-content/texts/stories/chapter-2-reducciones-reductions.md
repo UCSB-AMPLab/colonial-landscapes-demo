@@ -28,10 +28,12 @@ After the reducciones, crosses and Catholic symbols dominated the landscape and 
 image: history/2.2.3.jpg
 alt: Village of Soacha, 1627
 caption: Village of Soacha, 1627. Courtesy of the Archivo General de la Nación, Bogotá.
+
 ---
 image: history/2.2.4.jpg
 alt: Village of Sopó, 1758
 caption: Village of Sopó, 1758. Courtesy of the Archivo General de la Nación, Bogotá.
+
 ---
 image: history/2.2.5.jpg
 alt: Bogotá and la Serrezuela, 1771

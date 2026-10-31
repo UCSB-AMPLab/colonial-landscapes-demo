@@ -27,22 +27,27 @@ Different societies depict the world in different ways. There are visual, oral, 
 image: history/1.3.1.jpg
 alt: La carta universale della terra ferma & isole delle Indie occide[n]tali [Map of all the lands and islands of the West Indies]. Place and date of publication: Venice, 1534
 caption: La carta universale della terra ferma & isole delle Indie occide[n]tali [Map of all the lands and islands of the West Indies]. Place and date of publication: Venice, 1534. Courtesy of the John Carter Brown Library, Providence.
+
 ---
 image: history/1.3.2.jpg
 alt: Psalter, with additional hymns and prayers and a medieval world map (“The Map Psalter”). Place and date of publication: London, 1262-1300
 caption: Psalter, with additional hymns and prayers and a medieval world map (“The Map Psalter”). Place and date of publication: London, 1262-1300. Courtesy of the British Library, London.
+
 ---
 image: history/1.3.3.jpg
 alt: The Map of the World. Place and date of creation: Abu Habba (Sippar), approximately 6th century BCE
 caption: The Map of the World. Place and date of creation: Abu Habba (Sippar), approximately 6th century BCE. Courtesy of the British Museum, London.
+
 ---
 image: history/1.3.4.jpg
 alt: Painting, in black, on sealskin: a large number of small figures, including men in sledges drawn by reindeer, in canoes, harpooning whales, etc. Place and date of discovery: Bering Strait, Russia/Siberia, 1860 or 1870. Taken from the Pitt Rivers Museum, Oxford
 caption: Painting, in black, on sealskin: a large number of small figures, including men in sledges drawn by reindeer, in canoes, harpooning whales, etc. Place and date of discovery: Bering Strait, Russia/Siberia, 1860 or 1870. Taken from the Pitt Rivers Museum, Oxford.
+
 ---
 image: history/1.3.5.jpg
 alt: The Codex Quetzalecatzin. Place and date of creation: Mexico, 1593
 caption: The Codex Quetzalecatzin. Place and date of creation: Mexico, 1593. Courtesy of the Library of Congress, Washington, D. C.
+
 ---
 image: history/1.3.6.jpg
 alt: Map of the Crown Prince Islands, Disko Bay, Greenland. Place and date of creation: Disko Bay, 1926. Taken from the Library of Congress, Washington, D. C

@@ -12,10 +12,12 @@ This arbitrary category became the basis for the classification of the inhabitan
 image: history/2.1.1.jpg
 alt: “Cynocephalus.” Von Canibalien dem folck von Canaria, 1527
 caption: “Cynocephalus.” Von Canibalien dem folck von Canaria, 1527. Courtesy of John Carter Brown Library.
+
 ---
 image: history/2.1.2.jpg
 alt: “Indios.” Americaner in Peru, 1612
 caption: “Indios.” Americaner in Peru, 1612. Courtesy of John Carter Brown Library.
+
 ---
 image: history/2.1.3.jpg
 alt: La Figure E. F. Formes des cannoes ou batteaux des Caripous & autres Indiens. Comment les Caribes boucanent & mangent la chair de leurs enemies, 1665

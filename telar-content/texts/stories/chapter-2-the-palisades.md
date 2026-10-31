@@ -20,22 +20,27 @@ One of the Indigenous spaces that most intrigued the Spaniards was the chief’s
 image: history/2.4.1.jpg
 alt: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600
 caption: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600. Courtesy of the Museo del Oro (Bogotá).
+
 ---
 image: history/2.4.2.jpg
 alt: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600
 caption: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600. Courtesy of the Museo del Oro (Bogotá).
+
 ---
 image: history/2.4.3.jpg
 alt: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600
 caption: Votive figure in gold filigree. Eastern Range – Muisca. Date: 600-1600. Courtesy of the Museo del Oro (Bogotá).
+
 ---
 image: history/2.4.4.jpg
 alt: Votive figure shaped as an enclosure in gold filigree. Eastern Range – Muisca. Date: 600-1600
 caption: Votive figure shaped as an enclosure in gold filigree. Eastern Range – Muisca. Date: 600-1600. Courtesy of the Museo del Oro (Bogotá).
+
 ---
 image: history/2.4.5.jpg
 alt: Votive figure shaped as an enclosure with anthropomorphic figures in gold filigree. Eastern Range – Muisca. Date: 600-1600
 caption: Votive figure shaped as an enclosure with anthropomorphic figures in gold filigree. Eastern Range – Muisca. Date: 600-1600. Courtesy of the Museo del Oro (Bogotá).
+
 ---
 image: history/2.4.6.jpg
 alt: Golden object in the form of a palisade. Cundinamarca, Colombia
